@@ -2,3 +2,5 @@ _build
 results
 .git
 var
+base-images/var
+Dockerfile

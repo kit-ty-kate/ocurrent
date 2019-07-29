@@ -24,6 +24,7 @@ depends: [
   "cohttp-lwt-unix"
   "yojson"
   "tyxml"
+  "dockerfile-opam"
   "dune" {build}
   "alcotest-lwt" {with-test}
 ]

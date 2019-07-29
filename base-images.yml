@@ -1,0 +1,16 @@
+version: '3.1'
+volumes:
+  data:
+secrets:
+  ocurrent-hub:
+    external: true
+services:
+  builder:
+    image: base-images
+    ports:
+     - "8080:8080"
+    volumes:
+      - 'data:/var/lib/ocurrent'
+      - '/var/run/docker.sock:/var/run/docker.sock'
+    secrets:
+      - 'ocurrent-hub'
