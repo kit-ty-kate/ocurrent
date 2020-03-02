@@ -30,11 +30,11 @@ module Key = struct
     ]
 end
 
-module Value = Current.Unit
+module Value = Current.String
 
 let build { pool } job key =
   Current.Job.start job ?pool ~level:Current.Level.Average >>= fun () ->
-  Current.Process.exec ~cancellable:true ~job (Key.cmd key)
+  Current.Process.check_output ~cancellable:true ~job (Key.cmd key)
 
 let pp = Key.pp
 
