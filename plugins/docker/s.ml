@@ -42,7 +42,7 @@ module type DOCKER = sig
     ?pool:Current.Pool.t ->
     ?run_args:string list ->
     Image.t Current.t -> args:string list ->
-    string Current.t
+    unit Current.t
   (** [run image ~args] runs [image args] with Docker.
       @param run_args List of additional arguments to pass to the "docker
                       run" subcommand. *)
