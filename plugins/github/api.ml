@@ -512,8 +512,6 @@ module Commit = struct
 
   let hash (_, id) = id.Commit_id.hash
 
-  let kind (_, id) = id.Commit_id.id
-
   let pp = Fmt.using snd Commit_id.pp
 
   let set_status commit context status =
