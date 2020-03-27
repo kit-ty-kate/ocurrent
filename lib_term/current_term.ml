@@ -2,162 +2,108 @@ module S = S
 module Output = Output
 
 module Make (Input : S.INPUT) = struct
-  module An = Analysis.Make(struct type id = Input.job_id end)
-
-  type 'a node = {
-    md : An.t;
-    fn : 'a Dyn.t;
-  }
-
-  type context = {
-    user_env : Input.env;
-    default_env : An.env;
-  }
-
-  type 'a t = context -> 'a node
-
   type description = string
 
-  let make md fn =
-    { md; fn }
+  module Node = Node.Make(Input)
+  open Node
 
-  let bind_context = ref None
+  type 'a t = 'a Node.t
 
-  let with_bind_context bc f x =
-    assert (!bind_context = None);
+  let bind_context : bind_context ref = ref None
+
+  let node ?(id=Id.mint ()) ty v = { id; v; ty; bind = !bind_context }
+
+  let with_bind_context bc f =
+    let old = !bind_context in
     bind_context := Some bc;
-    let r = f x in
-    bind_context := None;
-    r
+    Fun.protect
+      (fun () -> f ())
+      ~finally:(fun () -> bind_context := old)
 
-  let cache f =
-    let last = ref None in
-    let bind = !bind_context in
-    fun ctx ->
-      match !last with
-      | Some (prev_ctx, cached) when prev_ctx == ctx -> cached
-      | _ ->
-        let env =
-          match bind with
-          | None -> ctx.default_env
-          | Some b -> An.with_bind b ctx.default_env
-        in
-        let r = f ~env ctx in
-        last := Some (ctx, r);
-        r
+  let with_id id = function
+    | Ok _ as v -> v
+    | Error e -> Error (id, e)
 
   let active s =
-    cache @@ fun ~env _ctx ->
-    make (An.active ~env s) (Dyn.active s)
+    let id = Id.mint () in
+    node ~id (Constant None) @@ Current_incr.const (Dyn.active ~id s)
 
   let return ?label x =
-    cache @@ fun ~env _ctx ->
-    make (An.return ~env label) (Dyn.return x)
+    node (Constant label) @@ Current_incr.const (Dyn.return x)
 
   let map_input ~label source x =
-    cache @@ fun ~env _ctx ->
-    make (An.map_input ~env source label) (Dyn.of_output x)
+    node (Map_input {source = Term source; info = label}) @@ Current_incr.const x
 
-  let option_input ~label source x =
-    cache @@ fun ~env _ctx ->
-    make (An.option_input ~env source label) (Dyn.of_output x)
+  let option_input source x =
+    node (Opt_input {source = Term source }) @@ Current_incr.const x
 
   let fail msg =
-    cache @@ fun ~env _ctx ->
-    make (An.fail ~env msg) (Dyn.fail msg)
+    let id = Id.mint () in
+    node ~id (Constant None) @@ Current_incr.const (Dyn.fail ~id msg)
 
   let state ?(hidden=false) t =
-    cache @@ fun ~env ctx ->
-    let t = t ctx in
-    let an = if hidden then t.md else An.state ~env t.md in
-    make an (Dyn.state t.fn)
+    node (State { source = Term t; hidden }) @@ Current_incr.map Dyn.state t.v
 
   let catch ?(hidden=false) t =
-    cache @@ fun ~env ctx ->
-    let t = t ctx in
-    let an = if hidden then t.md else An.catch ~env t.md in
-    make an (Dyn.catch t.fn)
-
-  let of_output x =
-    cache @@ fun ~env _ctx ->
-    make (An.of_output ~env x) (Dyn.of_output x)
+    node (Catch { source = Term t; hidden }) @@ Current_incr.map Dyn.catch t.v
 
   let component fmt = Fmt.strf ("@[<v>" ^^ fmt ^^ "@]")
 
-  let bind ?info (f:'a -> 'b t) (x:'a t) =
-    cache @@ fun ~env ctx ->
-    let x = x ctx in
-    let md = An.bind ~env ?info x.md in
-    match Dyn.run x.fn with
-    | Error (`Msg e) -> make (md (An.Fail e)) (Dyn.fail e)
-    | Error (`Active a) -> make (md (An.Active a)) (Dyn.active a)
-    | Ok y ->
-      let md = md An.Pass in
-      let f2 = with_bind_context md f y in
-      let r = f2 ctx in
-      An.set_state md (
-        match Dyn.run r.fn with
-        | Error (`Msg e) -> An.Fail e
-        | Error (`Active a) -> An.Active a
-        | Ok _ -> An.Pass
-      );
-      r
+  let join x =
+    Current_incr.of_cc begin
+      Current_incr.read x @@ fun y ->
+      Current_incr.read y.v Current_incr.write
+    end
 
-  let msg_of_exn = function
-    | Failure m -> m
-    | ex -> Printexc.to_string ex
+  let bind ?(info="") (f:'a -> 'b t) (x:'a t) =
+    let bind_in = node (Bind_in (Term x, info)) x.v in
+    let t =
+      x.v |> Current_incr.map @@ fun v ->
+      with_bind_context (Term bind_in) @@ fun () ->
+      match v with
+      | Error _ as e -> node (Constant None) @@ Current_incr.const e
+      | Ok y -> f y
+    in
+    let nested = Current_incr.map (fun t -> Term t) t in
+    node (Bind_out nested) (join t)
 
   let map f x =
-    cache @@ fun ~env ctx ->
-    let x = x ctx in
-    match Dyn.map f x.fn with
-    | fn -> make x.md fn
-    | exception ex ->
-      let msg = msg_of_exn ex in
-      make (An.map_failed ~env x.md msg) (Dyn.fail msg)
+    let id = Id.mint () in
+    node ~id (Map (Term x)) @@ Current_incr.map (Dyn.map ~id f) x.v
 
   let map_error f x =
-    cache @@ fun ~env ctx ->
-    let x = x ctx in
-    match Dyn.map_error f x.fn with
-    | fn -> make x.md fn
-    | exception ex ->
-      let msg = msg_of_exn ex in
-      make (An.map_failed ~env x.md msg) (Dyn.fail msg)
+    let id = Id.mint () in
+    node ~id (Map (Term x)) @@ Current_incr.map (Dyn.map_error ~id f) x.v
 
   let ignore_value x = map ignore x
 
   let pair a b =
-    cache @@ fun ~env ctx ->
-    let a = a ctx in
-    let b = b ctx in
-    let md = An.pair ~env a.md b.md in
-    let fn = Dyn.pair a.fn b.fn in
-    make md fn
+    node (Pair (Term a, Term b)) @@ Current_incr.of_cc begin
+      Current_incr.read a.v @@ fun a ->
+      Current_incr.read b.v @@ fun b ->
+      Current_incr.write @@ Dyn.pair a b
+    end
 
-  let bind_input ~info (f:'a -> 'b Input.t) (x:'a t) =
-    cache @@ fun ~env ctx ->
-    let x = x ctx in
-    let md = An.bind_input ~env ~info x.md in
-    match Dyn.run x.fn with
-    | Error (`Msg e) -> make (md (An.Fail e)) (Dyn.fail e)
-    | Error (`Active a) -> make (md (An.Active a)) (Dyn.active a)
-    | Ok y ->
-      let md = md An.Pass in
-      let input = f y in
-      let v, id = Input.get ctx.user_env input in
-      An.set_state md ?id (
-        match v with
-        | Error (`Msg e) -> An.Fail e
-        | Error (`Active a) -> An.Active a
-        | Ok _ -> An.Pass
-      );
-      make md (Dyn.of_output v)
+  let primitive ~info (f:'a -> 'b Input.t) (x:'a t) =
+    let id = Id.mint () in
+    let v_meta =
+      Current_incr.of_cc begin
+        Current_incr.read x.v @@ function
+        | Error _ as e -> Current_incr.write (e, None)
+        | Ok y ->
+          let input = f y in
+          Current_incr.read (Input.get input) @@ fun (v, job) ->
+          Current_incr.write (with_id id v, job)
+      end
+    in
+    let v = Current_incr.map fst v_meta in
+    let meta = Current_incr.map snd v_meta in
+    node ~id (Primitive { x = Term x; info; meta }) v
 
   module Syntax = struct
     let (let**) x f info = bind ~info f x
 
-    let (let>) x f info = bind_input ~info f x
+    let (let>) x f info = primitive ~info f x
     let (and>) = pair
 
     let (let*) x f = bind f x
@@ -199,57 +145,33 @@ module Make (Input : S.INPUT) = struct
     | Error (`Same (ls, e)) -> fail (Fmt.strf "%a failed: %s" Fmt.(list ~sep:(unit ", ") string) ls e)
     | Error (`Diff ls) -> fail (Fmt.strf "%a failed" Fmt.(list ~sep:(unit ", ") string) ls)
 
-  let option_map (f : 'a t -> 'b t) (input : 'a option t) =
-    cache @@ fun ~env ctx ->
-    let input = input ctx in
-    match Dyn.run input.fn with
-    | Error _ as r ->
-      (* Not ready; use static version. *)
-      let f = f (option_input ~label:`Blocked input.md r) ctx in
-      let md = An.option_map ~env ~f:f.md input.md in
-      make md (Dyn.of_output r)
-    | Ok None ->
-      (* Show what would have been done. *)
-      let r = Error (`Msg "(none)") in
-      let f = f (option_input input.md ~label:`Not_selected r) ctx in
-      let md = An.option_map ~env ~f:f.md input.md in
-      make md (Dyn.of_output (Ok None))
-    | Ok (Some item) ->
-      let results =
-        (let+ y = f (option_input input.md ~label:`Selected (Ok item)) in Some y) ctx
-      in
-      { results with md = An.option_map ~env ~f:results.md input.md }
+  (* A node with the constant value [v], but that depends on [old]. *)
+  let replace old v =
+    {
+      id = Id.mint ();
+      v = Current_incr.const v;
+      ty = Constant None;
+      bind = Some (Term old)
+    }
 
-  let list_map ~pp (f : 'a t -> 'b t) (input : 'a list t) =
-    cache @@ fun ~env ctx ->
-    let input = input ctx in
-    match Dyn.run input.fn with
-    | Error _ as r ->
-      (* Not ready; use static version of map. *)
-      let f = f (map_input input.md ~label:(Error `Blocked) r) ctx in
-      let md = An.list_map ~env ~f:f.md input.md in
-      make md (Dyn.of_output r)
-    | Ok [] ->
-      (* Empty list; show what would have been done. *)
-      let no_items = Error (`Msg "(empty list)") in
-      let f = f (map_input input.md ~label:(Error `Empty_list) no_items) ctx in
-      let md = An.list_map ~env ~f:f.md input.md in
-      make md (Dyn.return [])
-    | Ok items ->
-      (* Ready. Expand inputs. *)
-      let rec aux = function
-        | [] -> return []
-        | x :: xs ->
-          let+ y = f (map_input ~label:(Ok (Fmt.to_to_string pp x)) input.md (Ok x))
-          and+ ys = aux xs in
-          y :: ys
-      in
-      let results = aux items ctx in
-      { results with md = An.list_map ~env ~f:results.md input.md }
-
-  let list_iter ~pp f xs =
-    let+ (_ : unit list) = list_map ~pp f xs in
-    ()
+  let option_map (type a b) (f : a t -> b t) (input : a option t) : b option t =
+    let results =
+      input.v |> Current_incr.map @@ function
+      | Error _ as r ->
+        (* Not ready; use static version. *)
+        let output = f (option_input input r) in
+        replace output r
+      | Ok None ->
+        (* Show what would have been done. *)
+        let no_item = Error (Id.mint (), `Active `Ready) in
+        let output = f (option_input input no_item) in
+        replace output (Ok None)
+      | Ok (Some item) ->
+        let output = f (option_input input (Ok item)) in
+        { output with v = Current_incr.map (Result.map Option.some) output.v }
+    in
+    let output = Current_incr.map (fun x -> Term x) results in
+    node (Option_map { item = Term input; output }) (join results)
 
   let rec list_seq : 'a t list -> 'a list t = function
     | [] -> return []
@@ -258,45 +180,84 @@ module Make (Input : S.INPUT) = struct
       and+ ys = list_seq xs in
       y :: ys
 
+
+  let list_map (type a) (module M : S.ORDERED with type t = a) (f : a t -> 'b t) (input : a list t) =
+    let module Map = Map.Make(M) in
+    let module Sep = Current_incr.Separate(Map) in
+    (* Stage 1 : convert input list to a set.
+       This runs whenever the input list changes. *)
+    let as_map =
+      input.v |> Current_incr.map @@ function
+      | Ok items -> items |> List.fold_left (fun acc x -> Map.add x () acc) Map.empty
+      | _ -> Map.empty
+    in
+    (* Stage 2 : process each element separately.
+       We only process an element when it is first added to the set,
+       not on every change to the set. *)
+    let results =
+      Sep.map as_map @@ fun item ->
+      let label = Ok (Fmt.to_to_string M.pp item) in
+      Current_incr.write (f (map_input ~label input (Ok item)))
+    in
+    (* Stage 3 : combine results.
+       This runs whenever either the set of results changes, or the input list changes
+       (since the output order might need to change). *)
+    let results =
+      Current_incr.of_cc begin
+        Current_incr.read input.v @@ function
+        | Error _ as r ->
+          (* Not ready; use static version of map. *)
+          let output = f (map_input input ~label:(Error `Blocked) r) in
+          Current_incr.write @@ replace output r
+        | Ok [] ->
+          (* Empty list; show what would have been done. *)
+          let no_items = Error (Id.mint (), `Active `Ready) in
+          let output = f (map_input input ~label:(Error `Empty_list) no_items) in
+          Current_incr.write @@ replace output (Ok [])
+        | Ok items ->
+          Current_incr.read results @@ fun results ->
+          (* Convert result set to a results list. *)
+          let results = items |> List.map (fun item -> Map.find item results) |> list_seq in
+          Current_incr.write results
+      end
+    in
+    let output = Current_incr.map (fun x -> Term x) results in
+    node (List_map { items = Term input; output }) (join results)
+
+  let list_iter (type a) (module M : S.ORDERED with type t = a) f (xs : a list t) =
+    let+ (_ : unit list) = list_map (module M) f xs in
+    ()
+
   let option_seq : 'a t option -> 'a option t = function
     | None -> return None
     | Some x -> let+ y = x in Some y
 
   let gate ~on t =
-    cache @@ fun ~env ctx ->
-    let t = t ctx in
-    let on = on ctx in
-    let md = An.gate ~env ~on:on.md t.md in
-    let fn =
-      Dyn.bind on.fn @@ fun () ->
-      t.fn
-    in
-    make md fn
+    node (Gate_on { ctrl = Term on; value = Term t }) @@ Current_incr.of_cc begin
+      Current_incr.read t.v @@ fun t ->
+      Current_incr.read on.v @@ fun on ->
+      Current_incr.write @@ Dyn.bind on (fun () -> t)
+    end
 
-  let env =
-    cache @@ fun ~env ctx ->
-    make (An.return ~env None) (Dyn.return ctx.user_env)
+  let of_output x =
+    let id = Id.mint () in
+    node ~id (Constant None) @@ Current_incr.const (with_id id x)
 
   module Executor = struct
-    let run ~env:user_env f =
-      let default_env = An.make_env () in
-      let ctx = { default_env; user_env } in
-      try
-        let x = f () ctx in
-        Dyn.run x.fn, x.md
-      with ex ->
-        let msg = Printexc.to_string ex in
-        let fn = Dyn.fail msg |> Dyn.run in
-        let md = An.fail ~env:default_env msg in
-        fn, md
+    let run (t : 'a t) = Current_incr.map Dyn.run t.v
   end
 
   module Analysis = struct
-    include An
+    include Analysis.Make(Input)
 
-    let get t =
-      cache @@ fun ~env:_ ctx ->
-      let t = t ctx in
-      make t.md @@ Dyn.return t.md
+    (* This is a bit of a hack. *)
+    let job_id t =
+      let rec aux (Term t) =
+        match t.ty with
+        | Primitive p -> p.meta
+        | Map t -> aux t
+        | _ -> failwith "job_id: this is not a job term!"
+      in
+      node (Constant None) @@ Current_incr.map Result.ok @@ aux (Term t)
   end
 end

@@ -1,5 +1,16 @@
 open Lwt.Infix
 
+module Metrics = struct
+  open Prometheus
+
+  let namespace = "ocurrent"
+  let subsystem = "core"
+
+  let active_jobs =
+    let help = "Number of ready or running job" in
+    Gauge.v ~help ~namespace ~subsystem "active_jobs"
+end
+
 module Map = Map.Make(String)
 
 (* For unit-tests: *)
@@ -109,6 +120,7 @@ let create ~switch ~label ~config () =
     let t = { switch; id; ch = Some ch; start_time; set_start_time; config; log_cond; cancel_hooks;
               explicit_confirm; set_explicit_confirm; waiting_for_confirmation = false } in
     jobs := Map.add id t !jobs;
+    Prometheus.Gauge.inc_one Metrics.active_jobs;
     Switch.add_hook_or_fail switch (fun () ->
         begin match t.cancel_hooks with
           | `Hooks hooks ->
@@ -120,6 +132,7 @@ let create ~switch ~label ~config () =
         close_out ch;
         t.ch <- None;
         jobs := Map.remove id !jobs;
+        Prometheus.Gauge.dec_one Metrics.active_jobs;
         Lwt_condition.broadcast t.log_cond ();
         Lwt.return_unit
       );
@@ -147,7 +160,7 @@ let with_handler t ~on_cancel fn =
 let confirm t ?pool level =
   let confirmed =
     let confirmed = Config.confirmed level t.config in
-    Switch.add_hook_or_fail t.switch (fun _ -> Lwt.cancel confirmed; Lwt.return_unit);
+    on_cancel t (fun _ -> Lwt.cancel confirmed; Lwt.return_unit) >>= fun () ->
     match Lwt.state confirmed with
     | Lwt.Return () -> Lwt.return_unit
     | _ ->
@@ -217,3 +230,5 @@ let cancelled_state t =
   match t.cancel_hooks with
   | `Cancelled reason -> Error (`Msg reason)
   | `Hooks _ -> Ok ()
+
+let jobs () = !jobs

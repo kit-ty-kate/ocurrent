@@ -4,11 +4,13 @@
  (libraries
    current
    current.term
+   current_incr
    duration
    fmt
    logs
    lwt
    lwt.unix
+   prometheus
    re
    result
    sqlite3))

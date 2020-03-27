@@ -40,12 +40,12 @@ let watch update =
 
 let pp f = Fmt.string f "watch"
 
-let monitor = Current.monitor ~read ~watch ~pp
+let monitor = Current.Monitor.create ~read ~watch ~pp
 
 let input () =
   Current.component "input" |>
   let> () = Current.return () in
-  monitor
+  Current.Monitor.input monitor
 
 module Bool_var = Current.Var(struct type t = bool let pp = Fmt.bool let equal = (=) end)
 
@@ -70,17 +70,16 @@ let result =
   let error = Alcotest.testable pp (=) in
   Alcotest.(result unit) error
 
-let trace step { Current.Engine.value = out; watches = inputs; _ } =
+let trace step ~next:_ { Current.Engine.value = out; _ } =
   incr step;
   let step = !step in
-  Logs.info (fun f -> f "Step %d (inputs = %a)" step Fmt.(Dump.list Current.Engine.pp_metadata) inputs);
   match step with
   | 1 ->
     (* Although there is data ready, we shouldn't have started the read yet
        because we're still enabling the watch. *)
+    Lwt.pause () >>= fun () ->
     Alcotest.check result "Initially pending" (Error (`Active `Running)) out;
     assert (!w <> None);
-    assert (List.length inputs = 2);
     let w = get_watch () in
     Lwt.wakeup w.set_ready ();
     Lwt.return_unit
@@ -107,7 +106,6 @@ let trace step { Current.Engine.value = out; watches = inputs; _ } =
     Lwt.return_unit
   | 5 ->
     Alcotest.check result "Not wanted" (Ok ()) out;
-    assert (List.length inputs = 1);
     assert (!w <> None);
     Lwt.pause () >>= fun () ->
     (* Wanted again, before we've finished shutting down. *)
@@ -132,7 +130,6 @@ let trace step { Current.Engine.value = out; watches = inputs; _ } =
     Lwt.return_unit
   | 8 ->
     Alcotest.check result "Not wanted" (Ok ()) out;
-    assert (List.length inputs = 1);
     Lwt.pause () >>= fun () ->
     assert (!w <> None);
     Lwt_condition.broadcast unwatch ();   (* Allow shutdown to finish *)
@@ -142,6 +139,7 @@ let trace step { Current.Engine.value = out; watches = inputs; _ } =
     Lwt.return_unit
   | 9 ->
     Alcotest.check result "Pending again" (Error (`Active `Running)) out;
+    Lwt.pause () >>= fun () ->
     let w = get_watch () in
     Lwt.wakeup w.set_ready ();
     data := Some (Ok "baz");

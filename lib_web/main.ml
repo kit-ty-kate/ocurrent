@@ -17,6 +17,7 @@ let template contents =
     html
       (head (title (txt "OCurrent")) [
           link ~rel:[ `Stylesheet ] ~href:"/css/style.css" ();
+          meta ~a:[a_charset "UTF-8"] ();
         ]
       )
       (body [
@@ -24,6 +25,7 @@ let template contents =
             ul [
               li [a ~a:[a_href "/"] [txt "OCurrent"]];
               li [a ~a:[a_href "/"] [txt "Home"]];
+              li [a ~a:[a_href "/jobs"] [txt "Jobs"]];
               li [a ~a:[a_href "/query"] [txt "Query"]];
               li [a ~a:[a_href "/log-rules"] [txt "Log analysis"]];
             ]
@@ -54,7 +56,7 @@ let settings config =
 
 let dashboard engine =
   let config = Current.Engine.config engine in
-  let { Current.Engine.value; analysis = _; watches = _; jobs = _ } = Current.Engine.state engine in
+  let { Current.Engine.value; jobs = _ } = Current.Engine.state engine in
   template [
     div [
       object_ ~a:[a_data "/pipeline.svg"] [txt "Pipeline diagram"];

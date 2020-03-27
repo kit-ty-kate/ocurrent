@@ -1,8 +1,6 @@
 open Lwt.Infix
 open Current.Syntax
 
-exception Expect_skip
-
 let () =
   Printexc.record_backtrace true
 
@@ -22,89 +20,98 @@ let init_logging () =
   Logs.(set_level (Some Info));
   Logs.set_reporter reporter
 
+module SVar = Current.Var(struct
+    type t = (unit -> unit Current.t)
+    let equal = (==)
+    let pp f _ = Fmt.string f "pipeline"
+  end)
+let selected = SVar.create ~name:"current-test" (Error (`Msg "no-test"))
+
 module Git = Current_git_test
 module Docker = Current_docker_test
 
-let with_analysis ~name ~i (t : unit Current.t) =
-  let data =
-    let+ a = Current.Analysis.get t in
-    Logs.info (fun f -> f "Analysis: @[%a@]" Current.Analysis.pp a);
-    let url _ = None in
-    Fmt.strf "%a" (Current.Analysis.pp_dot ~url) a
-  in
-  let path = Current.return (Fpath.v (Fmt.strf "%s.%d.dot" name !i)) in
-  let* () = Current_fs.save path data in
-  t
+let test_pipeline =
+  Current.component "choose pipeline" |>
+  let** make_pipeline = SVar.get selected in
+  make_pipeline ()
 
 let current_watches = ref { Current.Engine.
                             value = Error (`Active `Ready);
-                            analysis = Current.Analysis.booting;
-                            watches = [];
-                            jobs = Current.Job_map.empty }
+                            jobs = Current.Job.Map.empty }
 
-let actions_of msg =
-  let name w = Fmt.strf "%a" Current.Engine.pp_metadata w in
-  let watches = (!current_watches).Current.Engine.watches in
-  match List.find_opt (fun w -> name w = msg) watches with
-  | None -> Fmt.failwith "No such watch %S." msg
-  | Some md ->
-    (* Check that the job is in the index too. *)
-    match Current.Engine.job_id md with
-    | None -> Fmt.failwith "Job %S does not have an ID!" msg
-    | Some job_id ->
-      let jobs = (!current_watches).Current.Engine.jobs in
-      match Current.Job_map.find_opt job_id jobs with
-      | None -> Fmt.failwith "Job %S is not in the index! Have @[%a@]"
-                  job_id
-                  Fmt.(Dump.list string) (Current.Job_map.bindings jobs |> List.map fst)
-      | Some actions -> actions
+let pp_job f j = j#pp f
+
+let find_by_descr msg =
+  let jobs = (!current_watches).Current.Engine.jobs |> Current.Job.Map.bindings in
+  match List.find_opt (fun (_, job) -> Fmt.strf "%t" job#pp = msg) jobs with
+  | None ->
+    Fmt.failwith "@[<v2>No job with description %S. We have:@,%a@]" msg
+      Fmt.(Dump.list pp_job) (List.map snd jobs)
+  | Some x -> x
 
 let cancel msg =
-  match (actions_of msg)#cancel with
-  | Some c -> c ()
+  let job_id, _actions = find_by_descr msg in
+  match Current.Job.lookup_running job_id with
+  | Some job -> Current.Job.cancel job "Cancelled by user"
   | None -> Fmt.failwith "Watch %S cannot be cancelled" msg
 
 let rebuild msg =
-  match (actions_of msg)#rebuild with
+  let _job_id, actions = find_by_descr msg in
+  match actions#rebuild with
   | None -> Fmt.failwith "Job %S cannot be rebuilt!" msg
   | Some rebuild -> rebuild () |> ignore
 
-let ready i = Current.Engine.is_stale i
+let stats =
+  let pp f { Current_term.S.ok; ready; running; failed; blocked } =
+    Fmt.pf f "ok=%d,ready=%d,running=%d,failed=%d,blocked=%d" ok ready running failed blocked
+  in
+  Alcotest.testable pp (=)
 
 (* Write two SVG files for pipeline [v]: one containing the static analysis
    before it has been run, and another once a particular commit hash has been
    supplied to it. *)
-let test ?config ~name v actions =
+let test ?config ?final_stats ~name v actions =
   Git.reset ();
   Docker.reset ();
-  (* Perform an initial analysis: *)
-  let i = ref 1 in
-  let trace step_result =
-    current_watches := step_result;
-    let { Current.Engine.watches; value = x; _} = step_result in
-    Logs.info (fun f -> f "--> %a" (Current_term.Output.pp (Fmt.unit "()")) x);
-    Logs.info (fun f -> f "@[<v>Depends on: %a@]" Fmt.(Dump.list Current.Engine.pp_metadata) watches);
+  SVar.set selected (Ok v);
+  let step = ref 1 in
+  Current_incr.propagate ();
+  let trace ~next step_result =
+    if !step = 0 then raise Exit;
     begin
-      let ready_watch = List.find_opt ready watches in
-      try
-        actions !i;
-        match ready_watch with
-        | Some i -> Fmt.failwith "Input already ready! %a" Current.Engine.pp_metadata i
-        | None -> ()
-      with
-      | Expect_skip -> assert (ready_watch <> None)
-      | Exit ->
-        List.iter (fun w -> (Current.Engine.actions w)#release) watches;
-        raise Exit
+      Logs.info (fun f -> f "Analysis: @[%a@]" Current.Analysis.pp test_pipeline);
+      let path = Fmt.strf "%s.%d.dot" name !step in
+      let ch = open_out path in
+      let f = Format.formatter_of_out_channel ch in
+      let url _ = None in
+      Fmt.pf f "%a@!" (Current.Analysis.pp_dot ~url) test_pipeline;
+      close_out ch
     end;
-    incr i;
-    Lwt.pause () >|= fun () ->
-    if not (List.exists ready watches) then failwith "No inputs ready (tests stuck)!"
+    current_watches := step_result;
+    let { Current.Engine.value = x; _} = step_result in
+    Logs.info (fun f -> f "--> %a" (Current_term.Output.pp (Fmt.unit "()")) x);
+    begin
+      if Lwt.state next <> Lwt.Sleep then Fmt.failwith "Already ready, and nothing changed yet!";
+      try actions !step with
+      | Exit ->
+        final_stats |> Option.iter (fun expected ->
+            Alcotest.check stats "Check final stats" expected @@ Current.Analysis.stats test_pipeline
+          );
+        SVar.set selected (Error (`Msg "test-over"));
+        step := -1
+    end;
+    incr step;
+    let rec wait i =
+      match i with
+      | 0 -> failwith "No inputs ready (tests stuck)!"
+      | i when Lwt.state next = Lwt.Sleep ->
+        Lwt.pause () >>= fun () ->
+        wait (i - 1)
+      | _ -> Lwt.return_unit
+    in
+    wait 3      (* Wait a few turns for things to become ready *)
   in
-  let engine =
-    Current.Engine.create ?config ~trace @@ fun () ->
-    with_analysis ~name ~i @@ v ()
-  in
+  let engine = Current.Engine.create ?config ~trace (fun () -> test_pipeline) in
   Lwt.catch
     (fun () -> Current.Engine.thread engine)
     (function

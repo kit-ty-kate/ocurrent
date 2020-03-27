@@ -117,10 +117,22 @@ module Commit_id = struct
     let gref = Ref.to_git id in
     Current_git.Commit_id.v ~repo ~gref ~hash
 
+  let uri t =
+    Uri.make ~scheme:"https" ~host:"github.com" ~path:(Printf.sprintf "/%s/commit/%s" t.owner_name t.hash) ()
+
   let pp_id = Ref.pp
 
+  let compare {owner_name; id; hash} b =
+    match compare hash b.hash with
+    | 0 ->
+      begin match Ref.compare id b.id with
+        | 0 -> compare owner_name b.owner_name
+        | x -> x
+      end
+    | x -> x
+
   let pp f { owner_name; id; hash } =
-    Fmt.pf f "@[<v>%s@,%a@,%s@]" owner_name pp_id id (Astring.String.with_range ~len:8 hash)
+    Fmt.pf f "%s@ %a@ %s" owner_name pp_id id (Astring.String.with_range ~len:8 hash)
 
   let digest t = Yojson.Safe.to_string (to_yojson t)
 end
@@ -130,17 +142,17 @@ type t = {
   get_token : unit -> token Lwt.t;
   token_lock : Lwt_mutex.t;
   mutable token : token;
-  mutable head_inputs : commit Current.Input.t Repo_map.t;
-  mutable ci_refs_inputs : ci_refs Current.Input.t Repo_map.t;
+  mutable head_monitors : commit Current.Monitor.t Repo_map.t;
+  mutable ci_refs_monitors : ci_refs Current.Monitor.t Repo_map.t;
 }
 and commit = t * Commit_id.t
 and ci_refs = commit Ref_map.t
 
 let v ~get_token account =
-  let head_inputs = Repo_map.empty in
-  let ci_refs_inputs = Repo_map.empty in
+  let head_monitors = Repo_map.empty in
+  let ci_refs_monitors = Repo_map.empty in
   let token_lock = Lwt_mutex.create () in
-  { get_token; token_lock; token = no_token; head_inputs; ci_refs_inputs; account }
+  { get_token; token_lock; token = no_token; head_monitors; ci_refs_monitors; account }
 
 let of_oauth token =
   let get_token () = Lwt.return { token = Ok token; expiry = None } in
@@ -254,7 +266,7 @@ let default_ref t { Repo_id.owner; name } =
       Log.err (fun f -> f "@[<v2>Invalid JSON: %a@,%a@]" Fmt.exn ex pp json);
       raise ex
 
-let make_head_commit_input t repo =
+let make_head_commit_monitor t repo =
   let read () =
     Lwt.catch
       (fun () -> default_ref t repo >|= fun c -> Ok (t, c))
@@ -280,17 +292,20 @@ let make_head_commit_input t repo =
     Lwt.return (fun () -> Lwt.cancel thread; Lwt.return_unit)
   in
   let pp f = Fmt.pf f "Watch %a default ref head" Repo_id.pp repo in
-  Current.monitor ~read ~watch ~pp
+  Current.Monitor.create ~read ~watch ~pp
 
 let head_commit t repo =
   Current.component "%a head" Repo_id.pp repo |>
   let> () = Current.return () in
-  match Repo_map.find_opt repo t.head_inputs with
-  | Some i -> i
-  | None ->
-    let i = make_head_commit_input t repo in
-    t.head_inputs <- Repo_map.add repo i t.head_inputs;
-    i
+  let monitor =
+    match Repo_map.find_opt repo t.head_monitors with
+    | Some i -> i
+    | None ->
+      let i = make_head_commit_monitor t repo in
+      t.head_monitors <- Repo_map.add repo i t.head_monitors;
+      i
+  in
+  Current.Monitor.input monitor
 
 let query_branches_and_open_prs = {|
   query($owner: String!, $name: String!) {
@@ -374,7 +389,7 @@ let get_ci_refs t { Repo_id.owner; name } =
       Log.err (fun f -> f "@[<v2>Invalid JSON: %a@,%a@]" Fmt.exn ex pp json);
       raise ex
 
-let make_ci_refs_input t repo =
+let make_ci_refs_monitor t repo =
   let read () =
     Lwt.catch
       (fun () -> get_ci_refs t repo >|= Stdlib.Result.ok)
@@ -400,15 +415,17 @@ let make_ci_refs_input t repo =
     Lwt.return (fun () -> Lwt.cancel thread; Lwt.return_unit)
   in
   let pp f = Fmt.pf f "Watch %a CI refs" Repo_id.pp repo in
-  Current.monitor ~read ~watch ~pp
+  Current.Monitor.create ~read ~watch ~pp
 
 let refs t repo =
-  match Repo_map.find_opt repo t.ci_refs_inputs with
-  | Some i -> i
-  | None ->
-    let i = make_ci_refs_input t repo in
-    t.ci_refs_inputs <- Repo_map.add repo i t.ci_refs_inputs;
-    i
+  Current.Monitor.input (
+    match Repo_map.find_opt repo t.ci_refs_monitors with
+    | Some i -> i
+    | None ->
+      let i = make_ci_refs_monitor t repo in
+      t.ci_refs_monitors <- Repo_map.add repo i t.ci_refs_monitors;
+      i
+  )
 
 let to_ci_refs refs =
   refs
@@ -463,7 +480,7 @@ module Commit = struct
     let auto_cancel = true
 
     let pp f ({ Key.commit; context }, status) =
-      Fmt.pf f "Set %a/%s to %a"
+      Fmt.pf f "Set %a/%s to@ %a"
         Commit_id.pp commit
         context
         Value.pp status
@@ -485,22 +502,35 @@ module Commit = struct
           (Yojson.Safe.pretty_print ~std:true) body;
         let body = body |> Yojson.Safe.to_string |> Cohttp_lwt.Body.of_string in
         Cohttp_lwt_unix.Client.post ~headers ~body uri >>= fun (resp, body) ->
-        Cohttp_lwt.Body.to_string body >|= fun body ->
-        match Cohttp.Response.status resp with
-        | `Created -> Ok ()
-        | err ->
-          Log.warn (fun f -> f "@[<v2>%a failed: %s@,%s@]"
-                       pp (key, status)
-                       (Cohttp.Code.string_of_status err)
-                       body);
-          Error (`Msg "Failed to set GitHub status")
+        Lwt.try_bind
+          (fun () -> Cohttp_lwt.Body.to_string body)
+          (fun body ->
+             match Cohttp.Response.status resp with
+             | `Created -> Lwt_result.return ()
+             | err ->
+               Log.warn (fun f -> f "@[<v2>%a failed: %s@,%s@]"
+                            pp (key, status)
+                            (Cohttp.Code.string_of_status err)
+                            body);
+               Lwt_result.fail (`Msg "Failed to set GitHub status")
+          )
+          (fun ex ->
+               Log.warn (fun f -> f "@[<v2>%a failed: %a@]"
+                            pp (key, status)
+                            Fmt.exn ex);
+               Lwt_result.fail (`Msg "Failed to set GitHub status")
+          )
   end
 
   module Set_status_cache = Current_cache.Output(Set_status)
 
   type t = commit
 
+  let uri (_, commit) = Commit_id.uri commit
+
   let id (_, commit_id) = Commit_id.to_git commit_id
+
+  let compare (_, a) (_, b) = Commit_id.compare a b
 
   let owner_name (_, id) = id.Commit_id.owner_name
 
@@ -526,16 +556,19 @@ module Repo = struct
 
   let id = snd
   let pp = Fmt.using id Repo_id.pp
+  let compare a b = Repo_id.compare (id a) (id b)
 
   let head_commit t =
     Current.component "head" |>
     let> (api, repo) = t in
-    match Repo_map.find_opt repo api.head_inputs with
-    | Some i -> i
-    | None ->
-      let i = make_head_commit_input api repo in
-      api.head_inputs <- Repo_map.add repo i api.head_inputs;
-      i
+    Current.Monitor.input (
+      match Repo_map.find_opt repo api.head_monitors with
+      | Some i -> i
+      | None ->
+        let i = make_head_commit_monitor api repo in
+        api.head_monitors <- Repo_map.add repo i api.head_monitors;
+        i
+    )
 
   let ci_refs t =
     let+ refs =

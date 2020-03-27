@@ -18,7 +18,7 @@ module Make (Current : S.CURRENT) = struct
   open Capnp_rpc_lwt
 
   module Job = struct
-    let job_cache = ref Current.Job_map.empty
+    let job_cache = ref Current.Job.Map.empty
 
     let stream_log_data ~job_id ~start =
       match Current.Job.log_path job_id with
@@ -38,7 +38,7 @@ module Make (Current : S.CURRENT) = struct
 
     let rec local engine job_id =
       let module Job = Api.Service.Job in
-      match Current.Job_map.find_opt job_id !job_cache with
+      match Current.Job.Map.find_opt job_id !job_cache with
       | Some job ->
         Capability.inc_ref job;
         job
@@ -46,7 +46,7 @@ module Make (Current : S.CURRENT) = struct
         let cap =
           let lookup () =
             let state = Current.Engine.state engine in
-            Current.Job_map.find_opt job_id (Current.Engine.jobs state)
+            Current.Job.Map.find_opt job_id (Current.Engine.jobs state)
           in
           Job.local @@ object
             inherit Job.service
@@ -88,14 +88,11 @@ module Make (Current : S.CURRENT) = struct
             method cancel_impl _params release_param_caps =
               release_param_caps ();
               Log.info (fun f -> f "cancel(%S)" job_id);
-              match lookup () with
+              match Current.Job.lookup_running job_id with
               | None -> Service.fail "Job is no longer active (cannot cancel)"
               | Some job ->
-                match job#cancel with
-                | None -> Service.fail "Job can no longer be cancelled"
-                | Some cancel ->
-                  cancel ();
-                  Service.return_empty ()
+                Current.Job.cancel job "Cancelled by user";
+                Service.return_empty ()
 
             method status_impl _params release_param_caps =
               let open Job.Status in
@@ -103,11 +100,16 @@ module Make (Current : S.CURRENT) = struct
               Log.info (fun f -> f "status(%S)" job_id);
               let response, results = Service.Response.create Results.init_pointer in
               Results.id_set results job_id;
+              let can_cancel =
+                match Current.Job.lookup_running job_id with
+                | Some job -> Current.Job.cancelled_state job = Ok ()
+                | None -> false
+              in
               begin match lookup () with
                 | None -> Results.description_set results "Inactive job"
                 | Some job ->
                   Results.description_set results (Fmt.strf "%t" job#pp);
-                  Results.can_cancel_set results (job#cancel <> None);
+                  Results.can_cancel_set results can_cancel;
                   Results.can_rebuild_set results (job#rebuild <> None);
               end;
               Service.return response
@@ -123,10 +125,10 @@ module Make (Current : S.CURRENT) = struct
                 Service.return response
 
             method! release =
-              job_cache := Current.Job_map.remove job_id !job_cache
+              job_cache := Current.Job.Map.remove job_id !job_cache
           end
         in
-        job_cache := Current.Job_map.add job_id cap !job_cache;
+        job_cache := Current.Job.Map.add job_id cap !job_cache;
         cap
 
     let local_opt engine job_id =
@@ -148,7 +150,7 @@ module Make (Current : S.CURRENT) = struct
         Log.info (fun f -> f "activeJobs");
         let response, results = Service.Response.create Results.init_pointer in
         let state = Current.Engine.state engine in
-        Current.Job_map.bindings (Current.Engine.jobs state)
+        Current.Job.Map.bindings (Current.Engine.jobs state)
         |> List.map fst |> Results.ids_set_list results |> ignore;
         Service.return response
 

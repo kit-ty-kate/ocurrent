@@ -15,6 +15,11 @@ module type T = sig
   val pp : t Fmt.t
 end
 
+module type ORDERED = sig
+  include Map.OrderedType
+  val pp : t Fmt.t
+end
+
 module type INPUT = sig
   type 'a t
   (** An input that was used while evaluating a term.
@@ -22,38 +27,27 @@ module type INPUT = sig
 
   type job_id
 
-  type env
-  (** A context which the caller can associate with an execution. *)
-
-  val get : env -> 'a t -> 'a Output.t * job_id option
+  val get : 'a t -> ('a Output.t * job_id option) Current_incr.t
 end
 
 module type ANALYSIS = sig
   type 'a term
   (** See [TERM]. *)
 
-  type t
-  (** Information about the dependency graph of a term.
-      This is useful to display the term's state as a diagram. *)
-
   type job_id
 
-  val booting : t
-  (** [booting] is a dummy analysis; useful while booting. *)
+  val job_id : 'a term -> job_id option term
+  (** [job_id t] is the job ID of [t], if any.
+      Raises an exception if [t] is not a primitive (or a map of one). *)
 
-  val get : _ term -> t term
-
-  val job_id : t -> job_id option
-  (** [job_id t] is the job ID of [t], if any. *)
-
-  val pp : t Fmt.t
+  val pp : _ term Fmt.t
   (** [pp] formats a [t] as a simple string. *)
 
-  val pp_dot : url:(job_id -> string option) -> t Fmt.t
+  val pp_dot : url:(job_id -> string option) -> _ term Fmt.t
   (** [pp_dot ~url] formats a [t] as a graphviz dot graph.
       @param url Generates a URL from an ID. *)
 
-  val stats : t -> stats
+  val stats : _ term -> stats
   (** [stats t] count how many stages are in each state. *)
 end
 
@@ -61,7 +55,7 @@ module type TERM = sig
   type 'a input
   (** See [INPUT]. *)
 
-  type +'a t
+  type 'a t
   (** An ['a t] is a term that produces a value of type ['a]. *)
 
   type description
@@ -107,12 +101,13 @@ module type TERM = sig
   (** [pair a b] is the pair containing the results of evaluating [a] and [b]
       (in parallel). *)
 
-  val list_map : pp:'a Fmt.t -> ('a t -> 'b t) -> 'a list t -> 'b list t
-  (** [list_map ~pp f xs] adds [f] to the end of each input term
+  val list_map : (module ORDERED with type t = 'a) -> ('a t -> 'b t) -> 'a list t -> 'b list t
+  (** [list_map (module T) f xs] adds [f] to the end of each input term
       and collects all the results into a single list.
-      @param pp Label the instances. *)
+      @param T Used to display labels for each item, and to avoid recreating pipelines
+               unnecessarily. *)
 
-  val list_iter : pp:'a Fmt.t -> ('a t -> unit t) -> 'a list t -> unit t
+  val list_iter : (module ORDERED with type t = 'a) -> ('a t -> unit t) -> 'a list t -> unit t
   (** Like [list_map] but for the simpler case when the result is unit. *)
 
   val list_seq : 'a t list -> 'a list t
@@ -150,10 +145,11 @@ module type TERM = sig
       [x] is ready, so using [bind] makes static analysis less useful. You can
       use the [info] argument to provide some information here. *)
 
-  val bind_input : info:description -> ('a -> 'b input) -> 'a t -> 'b t
-  (** [bind_input ~info f x] is a term that first runs [x] to get [y] and then
-      behaves as the input [f y]. [info] is used to describe the operation
-      in the analysis result. *)
+  val primitive : info:description -> ('a -> 'b input) -> 'a t -> 'b t
+  (** [primitive ~info f x] is a term that evaluates [f] on each new value of [x].
+      This is used to provide the primitive operations, which can then be
+      combined using the other combinators in this module.
+      [info] is used to label the operation in the diagram. *)
 
   val component : ('a, Format.formatter, unit, description) format4 -> 'a
   (** [component name] is used to annotate binds, so that the system can show a
@@ -208,12 +204,6 @@ module type EXECUTOR = sig
   type 'a term
   (** See [TERM]. *)
 
-  type env
-  (** See [INPUT]. *)
-
-  type analysis
-  (** See [ANALYSIS]. *)
-
-  val run : env:env -> (unit -> 'a term) -> 'a Output.t * analysis
-  (** [run ~env f] evaluates term [f ()], returning the current output and its analysis. *)
+  val run : 'a term -> 'a Output.t Current_incr.t
+  (** [run t] is the output value of [t] (i.e. without the static analysis part). *)
 end

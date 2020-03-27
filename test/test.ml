@@ -11,6 +11,9 @@ let build = Docker.build
 let test = Docker.run ~cmd:["make"; "test"]
 let push = Docker.push
 
+let engine_result =
+  Alcotest.testable (Current_term.Output.pp Fmt.(const string "()")) (Current_term.Output.equal (=))
+
 let analyse ~lint src =
   Current.component "analyse" |>
   let** _ = src in
@@ -80,7 +83,16 @@ let v3 commit =
   Current.all @@ List.map gated_deploy binaries
 
 let test_v3 _switch () =
-  Driver.test ~name:"v3" (with_commit v3) @@ function
+  let final_stats =
+    { Current_term.S.
+      ok = 8;
+      failed = 1;
+      ready = 0;
+      running = 1;
+      blocked = 6;
+    }
+  in
+  Driver.test ~name:"v3" (with_commit v3) ~final_stats @@ function
   | 1 -> Git.complete_clone test_commit
   | 2 ->
     Docker.complete "lin-image-src-123" ~cmd:["make"; "test"] @@ Ok ();
@@ -116,7 +128,7 @@ let v5 commit =
   let ok = test bin in
   Opam.revdeps src
   |> Current.gate ~on:ok
-  |> Current.list_iter ~pp:(Git.Commit.pp) (fun s -> s |> fetch |> build |> test)
+  |> Current.list_iter (module Git.Commit) (fun s -> s |> fetch |> build |> test)
 
 let test_v5 _switch () =
   Driver.test ~name:"v5" (with_commit v5) @@ function
@@ -151,21 +163,49 @@ let test_option_none _switch () =
     | 1 -> Git.complete_clone test_commit
     | _ -> raise Exit)
 
-module Test_input = struct
-  type 'a t = unit
-  type job_id = unit
-  type env = unit
+(* This is just to check the diagram when the state box is hidden. *)
+let test_state _switch () =
+  let pipeline () =
+    Current.component "set-status" |>
+    let** value = Current.state ~hidden:true (Current.active `Ready) in
+    Alcotest.(check engine_result) "Pending" (Error (`Active `Ready)) value;
+    Current.return ()
+  in
+  Driver.test ~name:"state" pipeline @@ function
+  | _ -> raise Exit
 
-  let get () () = Error (`Msg "Can't happen"), None
+let test_pair _switch () =
+  let show label x = (* Make it show up on the diagram so we can see the input state. *)
+    Current.component "%s" label |>
+    let> () = x in
+    Current.Input.const ()
+  in
+  let check name expected x =
+    let+ s = Current.state (show name x) in
+    Alcotest.check engine_result name expected s
+  in
+  let pipeline () =
+    let ok = Current.return () in
+    let pending = Current.active `Running in
+    let failed = Current.fail "failed" in
+    Current.all [
+      check "Blocked-1" (Error (`Msg "failed")) (Current.all [ok; pending; failed]);
+      check "Blocked-2" (Error (`Msg "failed")) (Current.all [failed; pending; ok]);
+      check "Blocked-3" (Error (`Active `Running)) (Current.all [pending; ok]);
+    ]
+  in
+  Driver.test ~name:"pair" pipeline (fun _ -> raise Exit)
+
+module Test_input = struct
+  type job_id = string
+  type 'a t = ('a Current_term.Output.t * job_id option) Current_incr.t
+  let get x = x
 end
 
 module Term = Current_term.Make(Test_input)
 
-let engine_result =
-  Alcotest.testable (Current_term.Output.pp Fmt.(const string "()")) (Current_term.Output.equal (=))
-
 let test_all_labelled () =
-  let test x = fst (Term.Executor.run ~env:() (fun () -> Term.all_labelled x)) in
+  let test x = Current_incr.observe (Term.Executor.run (Term.all_labelled x)) in
   Alcotest.check engine_result "all_ok" (Ok ()) @@ test [
     "Alpine", Term.return ();
     "Debian", Term.return ();
@@ -187,6 +227,18 @@ let test_all_labelled () =
     "Debian", Term.fail "ENOSPACE";
   ]
 
+let job x =
+  let info = Term.component "job" in
+  Term.primitive ~info (fun () -> Current_incr.const (Ok (), Some x)) @@ Term.return ()
+
+let test_job_id () =
+  let pipeline =
+    let j = Term.map ignore (job "1") in
+    Term.Analysis.job_id j
+  in
+  let job_id = Current_incr.observe (Term.Executor.run pipeline) in
+  Alcotest.(check (result (option string) reject)) "Got job ID" (Ok (Some "1")) job_id
+
 module Cli = Alcotest.Cli.Make(Lwt)
 
 let () =
@@ -202,9 +254,12 @@ let () =
         Driver.test_case_gc "v5-nil"      test_v5_nil;
         Driver.test_case_gc "option-some" test_option_some;
         Driver.test_case_gc "option-none" test_option_none;
+        Driver.test_case_gc "state"       test_state;
+        Driver.test_case_gc "pair"        test_pair;
       ];
       "terms", [
         Alcotest_lwt.test_case_sync "all_labelled" `Quick test_all_labelled;
+        Alcotest_lwt.test_case_sync "job_id"       `Quick test_job_id;
       ];
       "cache", Test_cache.tests;
       "monitor", Test_monitor.tests;

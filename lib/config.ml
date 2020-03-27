@@ -32,6 +32,10 @@ let v ?auto_release ?confirm () =
 
 let default = v ()
 
+let active_config : t option Current_incr.var = Current_incr.var None
+
+let now = Current_incr.of_var active_config
+
 let rec confirmed l t =
   match t.confirm with
   | Some threshold when Level.compare l threshold >= 0 ->

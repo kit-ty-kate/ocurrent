@@ -17,6 +17,9 @@ module Config : sig
   val get_confirm : t -> Level.t option
 
   val cmdliner : t Cmdliner.Term.t
+
+  val now : t option Current_incr.t
+  (** The configuration of the engine, if any. *)
 end
 
 type job_id = string
@@ -25,85 +28,49 @@ class type actions = object
   method pp : Format.formatter -> unit
   (** Format a message for the user explaining what is being waited on. *)
 
-  method cancel : (unit -> unit) option
-  (** A function to call if the user explicitly requests the operation be cancelled,
-      or [None] if it is not something that can be cancelled. *)
-
   method rebuild : (unit -> job_id) option
   (** A function to call if the user explicitly requests the operation be done again,
       or [None] if it is not something that can be repeated. Returns the new job ID. *)
-
-  method release : unit
-  (** Called to release the caller's reference to the watch (reduce the
-      ref-count by 1). Some inputs may cancel a build if the ref-count
-      reaches zero. *)
-end
-
-module Step : sig
-  type t
-  type id
-
-  val id : t -> id
-  (** [id t] is a unique value for this evaluation step.
-      This can be useful to detect if e.g. the same output has been set to two different values in one step. *)
-
-  val config : t -> Config.t
 end
 
 module Input : sig
-  type 'a t
-  (** An input that produces an ['a term]. *)
-
-  type metadata
-  (** Information about a value of the input at some point. *)
+  type 'a t = ('a Current_term.Output.t * job_id option) Current_incr.t
 
   val const : 'a -> 'a t
   (** [const x] is an input that always evaluates to [x] and never needs to be updated. *)
-
-  val metadata :
-    ?job_id:job_id ->
-    ?changed:unit Lwt.t ->
-    actions -> metadata
-  (** [metadata actions] is used to provide metadata about a value.
-      @param job_id An ID that can be used to refer to this job later (to request a rebuild, etc).
-      @param changed A Lwt promise that resolves when the input has changed (and so terms
-                     using it should be recalculated).
-      @param actions Ways to interact with this input. *)
-
-  val of_fn : (Step.t -> 'a Current_term.Output.t * metadata) -> 'a t
-  (** [of_fn f] is an input that calls [f config] when it is evaluated.
-      When [f] is called, the caller gets a ref-count on the watches and will
-      call [release] exactly once when each watch is no longer needed.
-
-      Note: the engine calls [f] in an evaluation before calling [release]
-      on the previous watches, so if the ref-count drops to zero then you can
-      cancel the job. *)
 
   val map_result : ('a Current_term.Output.t -> 'b Current_term.Output.t) -> 'a t -> 'b t
   (** [map_result fn t] transforms the result of [t] with [fn]. The metadata remains the same.
       If [fn] raises an exception, this is converted to [Error]. *)
 end
 
-module Job_map : Map.S with type key = job_id
+module Monitor : sig
+  type 'a t
+  (** An ['a t] is a monitor that outputs values of type ['a]. *)
 
-val monitor :
-  read:(unit -> 'a or_error Lwt.t) ->
-  watch:((unit -> unit) -> (unit -> unit Lwt.t) Lwt.t) ->
-  pp:(Format.formatter -> unit) ->
-  'a Input.t
-(** [monitor ~read ~watch ~pp] is an input that uses [read] to read the current
-    value of some external resource and [watch] to watch for changes. When the
-    input is needed, it first calls [watch refresh] to start watching the
-    resource. When this completes, it uses [read ()] to read the current value.
-    Whenever the watch thread calls [refresh] it marks the value as being
-    out-of-date and will call [read] to get a new value. When the input is no
-    longer required, it will call the shutdown function returned by [watch] to
-    stop watching the resource. If it is needed later, it will run [watch] to
-    start watching it again. This function takes care to perform only one user
-    action (installing the watch, reading the value, or turning off the watch)
-    at a time. For example, if [refresh] is called while already reading a
-    value then it will wait for the current read to complete and then perform a
-    second one. *)
+  val create :
+    read:(unit -> 'a or_error Lwt.t) ->
+    watch:((unit -> unit) -> (unit -> unit Lwt.t) Lwt.t) ->
+    pp:(Format.formatter -> unit) ->
+    'a t
+  (** [create ~read ~watch ~pp] is a monitor that uses [read] to read the current
+      value of some external resource and [watch] to watch for changes.
+      When the monitor is needed, it first calls [watch refresh] to start watching the
+      resource. When this completes, it uses [read ()] to read the current value.
+      Whenever the watch thread calls [refresh] it marks the value as being
+      out-of-date and will call [read] to get a new value. When the monitor is no
+      longer required, it will call the shutdown function returned by [watch] to
+      stop watching the resource. If it is needed later, it will run [watch] to
+      start watching it again. This function takes care to perform only one user
+      action (installing the watch, reading the value, or turning off the watch)
+      at a time. For example, if [refresh] is called while already reading a
+      value then it will wait for the current read to complete and then perform a
+      second one. *)
+
+  val input : 'a t -> 'a Input.t
+  (** [input t] enables [t] and returns the input for it. When the input is
+      released, the monitor will be disabled. Call this in your [let>] block. *)
+end
 
 include Current_term.S.TERM with type 'a input := 'a Input.t
 
@@ -113,54 +80,6 @@ type 'a term = 'a t
 module Analysis : Current_term.S.ANALYSIS with
   type 'a term := 'a t and
   type job_id := job_id
-
-module Engine : sig
-  type t
-
-  type metadata
-
-  type results = {
-    value : unit Current_term.Output.t;
-    analysis : Analysis.t;
-    watches : metadata list;
-    jobs : actions Job_map.t;        (** The jobs currently being used (whether running or finished). *)
-  }
-
-  val create :
-    ?config:Config.t ->
-    ?trace:(results -> unit Lwt.t) ->
-    (unit -> unit term) ->
-    t
-  (** [create pipeline] is a new engine running [pipeline].
-      The engine will evaluate [t]'s pipeline immediately, and again whenever
-      one of its inputs changes. *)
-
-  val state : t -> results
-  (** The most recent results from evaluating the pipeline. *)
-
-  val jobs : results -> actions Job_map.t
-
-  val thread : t -> 'a Lwt.t
-  (** [thread t] is the engine's thread.
-      Use this to monitor the engine (in case it crashes). *)
-
-  val actions : metadata -> actions
-
-  val job_id : metadata -> job_id option
-
-  val config : t -> Config.t
-
-  val is_stale : metadata -> bool
-  (** [is_stale m] is [true] if this job has signalled that
-      it should be re-evaluated. Provided for unit-tests. *)
-
-  val pp_metadata : metadata Fmt.t
-
-  val update_metrics : results -> unit
-  (** [update_metrics results] reports how many pipeline stages are in each state via Prometheus.
-      Call this on each metrics collection if you have exactly one pipeline. The default web
-      UI does this automatically. *)
-end
 
 module Var (T : Current_term.S.T) : sig
   type t
@@ -247,6 +166,8 @@ end
 module Job : sig
   type t
 
+  module Map : Map.S with type key = job_id
+
   val create : switch:Switch.t -> label:string -> config:Config.t -> unit -> t
   (** [create ~switch ~label ~config ()] is a new job.
       @param switch Turning this off will cancel the job.
@@ -287,6 +208,10 @@ module Job : sig
   val lookup_running : job_id -> t option
   (** If [lookup_running job_id] is the job [j] with id [job_id], if [is_running j]. *)
 
+  val jobs : unit -> t Map.t
+  (** [jobs ()] is the set of active jobs, whether they are currently used in a pipeline or not.
+      This is any job which is running or ready to run (i.e. every job which hasn't closed its log file). *)
+
   val approve_early_start : t -> unit
   (** [approve_early_start t] marks the job as approved to start even if the
       global confirmation threshold would otherwise prevent it. Calling this
@@ -303,7 +228,7 @@ module Job : sig
   val with_handler : t -> on_cancel:(string -> unit Lwt.t) -> (unit -> 'a Lwt.t) -> 'a Lwt.t
   (** [with_handler t ~on_cancel fn] is like [fn ()], but if the job is cancelled while [fn] is running
       then [on_cancel reason] is called. Even if cancelled, [fn] is still run to completion.
-      If the job has already been cancelled then [fn reason] is called immediately (but [fn] still runs). *)
+      If the job has already been cancelled then [on_cancel reason] is called immediately (but [fn] still runs). *)
 
   val cancel : t -> string -> unit
   (** [cancel msg] requests that [t] be cancelled. This runs all registered cancel hooks and marks the job as cancelled.
@@ -313,12 +238,73 @@ module Job : sig
   (** [cancelled_state t] is [Ok ()] if the job hasn't been cancelled, or [Error (`Msg reason)] if it has.
       This should not be used after the switch has been turned off. *)
 
+  val register_actions : job_id -> actions -> unit
+  (** [register_actions job_id actions] is used to register handlers for e.g. rebuilding jobs. *)
+
   (**/**)
 
   (* For unit tests we need our own test clock: *)
 
   val timestamp : (unit -> float) ref
   val sleep : (float -> unit Lwt.t) ref
+end
+
+module Engine : sig
+  type t
+
+  type results = {
+    value : unit Current_term.Output.t;
+    jobs : actions Job.Map.t;        (** The jobs currently being used (whether running or finished). *)
+  }
+
+  val create :
+    ?config:Config.t ->
+    ?trace:(next:unit Lwt.t -> results -> unit Lwt.t) ->
+    (unit -> unit term) ->
+    t
+  (** [create pipeline] is a new engine running [pipeline].
+      The engine will evaluate [t]'s pipeline immediately, and again whenever
+      one of its inputs changes. *)
+
+  val update : unit -> unit
+  (** Trigger a reevaluation of the pipeline.
+      Inputs should call this whenever they might now produce a different result
+      (e.g. an active input becomes finished). *)
+
+  val state : t -> results
+  (** The most recent results from evaluating the pipeline. *)
+
+  val jobs : results -> actions Job.Map.t
+
+  val thread : t -> 'a Lwt.t
+  (** [thread t] is the engine's thread.
+      Use this to monitor the engine (in case it crashes). *)
+
+  val config : t -> Config.t
+
+  val pipeline : t -> unit term
+
+  val update_metrics : t -> unit
+  (** [update_metrics t] reports how many pipeline stages are in each state via Prometheus.
+      Call this on each metrics collection if you have exactly one pipeline. The default web
+      UI does this automatically. *)
+
+  val on_disable : (unit -> unit) -> unit
+  (** [on_disable fn] schedules [fn ()] to be called after the next evaluation.
+      You can increment a ref-count when calling this and then check it when the
+      callback is called. If it is then zero, the operation is no longer required
+      and you can e.g. cancel the job. *)
+
+  module Step : sig
+    type t
+    (** A unique ID representing the current iteration.
+        This is used by the cache to warn about attempts to set the same output
+        to two different values at the same time. *)
+
+    val equal : t -> t -> bool
+
+    val now : unit -> t
+  end
 end
 
 module Process : sig

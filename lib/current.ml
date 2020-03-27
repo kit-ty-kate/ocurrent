@@ -4,8 +4,6 @@ type 'a or_error = ('a, [`Msg of string]) result
 
 module Config = Config
 
-module Job_map = Job.Map
-
 module Metrics = struct
   open Prometheus
 
@@ -25,187 +23,144 @@ type job_id = string
 
 class type actions = object
   method pp : Format.formatter -> unit
-  method cancel : (unit -> unit) option
   method rebuild : (unit -> job_id) option
-  method release : unit
-end
-
-type job_metadata = {
-  job_id : job_id option;
-  changed : unit Lwt.t option;
-  actions : actions;
-}
-
-module Step = struct
-  type id = < >
-
-  type t = {
-    id : id;
-    config : Config.t;
-    mutable jobs : actions Job_map.t;
-    mutable watches : job_metadata list;
-  }
-
-  let id t = t.id
-
-  let create config =
-    let jobs = Job_map.empty in
-    { config; jobs; watches = []; id = object end }
-
-  let register_job t id actions =
-    t.jobs <- Job_map.add id actions t.jobs
-
-  let config t = t.config
 end
 
 module Input = struct
   type nonrec job_id = job_id
 
-  type metadata = job_metadata
+  type 'a t = ('a Current_term.Output.t * job_id option) Current_incr.t
 
-  type 'a t = Step.t -> 'a Current_term.Output.t * metadata
+  let const x = Current_incr.const (Ok x, None)
 
-  type env = Step.t
+  let get (t : 'a t) = t
 
-  let metadata ?job_id ?changed actions =
-    { job_id; changed; actions }
-
-  let of_fn f step =
-    try f step
-    with ex ->
-      Log.warn (fun f -> f "Uncaught exception from input: %a" Fmt.exn ex);
-      Error (`Msg (Printexc.to_string ex)), metadata @@ object
-        method pp f = Fmt.exn f ex
-        method cancel = None
-        method rebuild = None
-        method release = ()
-      end
-
-  let const x =
-    of_fn @@ fun _env ->
-    Ok x, metadata @@ object
-      method pp f = Fmt.string f "Input.const"
-      method cancel = None
-      method rebuild = None
-      method release = ()
+  let map_result fn t =
+    Current_incr.of_cc begin
+      Current_incr.read t @@ fun (x, md) ->
+      let y = try fn x with ex -> Error (`Msg (Printexc.to_string ex)) in
+      Current_incr.write (y, md)
     end
-
-  let get step (t : 'a t) =
-    let value, metadata = t step in
-    let { job_id; changed = _; actions } = metadata in
-    step.watches <- metadata :: step.watches;
-    begin match job_id with
-      | None -> ()
-      | Some job_id -> Step.register_job step job_id actions
-    end;
-    (value, job_id)
-
-  let map_result fn t step =
-    let x, md = t step in
-    let y = try fn x with ex -> Error (`Msg (Printexc.to_string ex)) in
-    y, md
 end
 
 include Current_term.Make(Input)
 
 type 'a term = 'a t
 
-module Var (T : Current_term.S.T) = struct
-  type t = {
-    mutable current : T.t Current_term.Output.t;
-    name : string;
-    cond : unit Lwt_condition.t;
-  }
-
-  let create ~name current =
-    { current; name; cond = Lwt_condition.create () }
-
-  let get t =
-    let open Syntax in
-    component "%s" t.name |>
-    let> () = return () in
-    Input.of_fn @@ fun _env ->
-    let changed = Lwt_condition.wait t.cond in
-    t.current, Input.metadata ~changed @@
-    object
-      method pp f = Fmt.string f t.name
-      method cancel = None
-      method rebuild = None
-      method release = ()
-    end
-
-  let set t v =
-    t.current <- v;
-    Lwt_condition.broadcast t.cond ()
-
-  let update t f =
-    t.current <- f t.current;
-    Lwt_condition.broadcast t.cond ()
-end
-
-let rec filter_map f = function
-  | [] -> []
-  | x :: xs ->
-    match f x with
-    | None -> filter_map f xs
-    | Some y -> y :: filter_map f xs
-
 module Engine = struct
-  type metadata = job_metadata
+  (* Active jobs are ones which are referenced by the active pipeline.
+     These are the only ones which can have actions attached.
+     There are a list of actions objects for each job because the same job may
+     appear multiple times in a pipeline. We only use the head object at any
+     one time, but we need to cope with that disappearing. *)
+  let active_jobs : actions list Job.Map.t ref = ref Job.Map.empty
+
+  module Step = struct
+    type t = < >
+    let create () = object end
+    let equal = (=)
+    let current_step = ref (create ())
+    let now () = !current_step
+    let advance () =
+      current_step := create ()
+  end
 
   type results = {
     value : unit Current_term.Output.t;
-    analysis : Analysis.t;
-    watches : metadata list;
-    jobs : actions Job_map.t;
+    jobs : actions Job.Map.t;
   }
 
   type t = {
     thread : 'a. 'a Lwt.t;
     last_result : results ref;
+    pipeline : unit term Lazy.t;
     config : Config.t;
   }
 
+  (* Functions to call at end-of-propagate.
+     When an incremental calculation that performed some side-effect (e.g.
+     incrementing a ref-counter) needs to be re-done, we add the compensating
+     operation here. We run them only once the propagation is complete so that
+     if the replacement computation also increments the ref-counter then we
+     won't destroy the job just to recreate it immediately. *)
+  let release_queue = Queue.create ()
+
+  let rec flush_release_queue () =
+    match Queue.take_opt release_queue with
+    | None -> ()
+    | Some fn ->
+      fn ();
+      flush_release_queue ()
+
+  let propagate = Lwt_condition.create ()
+
+  let update () =
+    Lwt_condition.broadcast propagate ()
+
   let booting = {
     value = Error (`Active `Running);
-    analysis = Analysis.booting;
-    watches = [];
-    jobs = Job_map.empty;
+    jobs = Job.Map.empty;
   }
 
-  let default_trace r =
+  let default_trace ~next:_ r =
     Log.info (fun f -> f "Result: %a" Current_term.(Output.pp Fmt.(unit "()")) r.value);
     Lwt.return_unit
 
+  let pipeline t = Lazy.force t.pipeline
+
   let create ?(config=Config.default) ?(trace=default_trace) f =
     let last_result = ref booting in
-    let rec aux () =
-      let old = !last_result in
+    let rec aux outcome =
+      let next = Lwt_condition.wait propagate in
       Log.debug (fun f -> f "Evaluating...");
-      let step = Step.create config in
       let t0 = Unix.gettimeofday () in
-      let r, an = Executor.run ~env:step f in
+      Current_incr.propagate ();
       let t1 = Unix.gettimeofday () in
       Prometheus.Summary.observe Metrics.evaluation_time_seconds (t1 -. t0);
-      let watches = step.Step.watches in
-      List.iter (fun w -> w.actions#release) old.watches;
+      (* Release all the old inputs, now we've had a chance to create any replacements. *)
+      flush_release_queue ();
+      let r = Current_incr.observe outcome in
       last_result := {
         value = r;
-        analysis = an;
-        watches;
-        jobs = step.Step.jobs;
+        jobs = Job.Map.map List.hd !active_jobs;
       };
-      trace !last_result >>= fun () ->
+      trace ~next !last_result >>= fun () ->
       Log.debug (fun f -> f "Waiting for inputs to change...");
-      Lwt.choose (filter_map (fun w -> w.changed) watches) >>= fun () ->
-      Lwt.pause () >>= aux
+      next >>= fun () ->
+      Lwt.pause () >>= fun () ->
+      Step.advance ();
+      aux outcome
     in
+    let pipeline = lazy (f ()) in
     let thread =
       (* The pause lets us start the web-server before the first evaluation,
          and also frees us from handling an initial exception specially. *)
-      Lwt.pause () >>= aux
+      Lwt.pause () >>= fun () ->
+      if Current_incr.observe Config.now <> None then
+        failwith "Engine is already running (Config.now already set)!";
+      Current_incr.change Config.active_config (Some config);
+      Lwt.finalize
+        (fun () ->
+           Lwt.catch
+             (fun () ->
+                aux (Executor.run (Lazy.force pipeline))
+             )
+             (fun ex ->
+                if ex = Exit then (
+                  (* Clean up, for unit-tests *)
+                  Current_incr.propagate ();
+                  flush_release_queue ();
+                );
+                Lwt.fail ex
+             )
+        )
+        (fun () -> Current_incr.change Config.active_config None; Lwt.return_unit)
     in
-    { thread; last_result; config }
+    { thread; last_result; config; pipeline }
+
+  let on_disable fn =
+    Current_incr.on_release @@ fun () ->
+    Queue.add fn release_queue
 
   let state t = !(t.last_result)
 
@@ -215,19 +170,8 @@ module Engine = struct
 
   let thread t = t.thread
 
-  let actions m = m.actions
-
-  let job_id m = m.job_id
-
-  let pp_metadata f m = m.actions#pp f
-
-  let is_stale m =
-    match m.changed with
-    | Some p -> Lwt.state p <> Lwt.Sleep
-    | None -> false
-
-  let update_metrics results =
-    let { Current_term.S.ok; ready; running; failed; blocked } = Analysis.stats results.analysis in
+  let update_metrics t =
+    let { Current_term.S.ok; ready; running; failed; blocked } = Analysis.stats (pipeline t) in
     Prometheus.Gauge.set (Metrics.pipeline_stage_total "ok") (float_of_int ok);
     Prometheus.Gauge.set (Metrics.pipeline_stage_total "ready") (float_of_int ready);
     Prometheus.Gauge.set (Metrics.pipeline_stage_total "running") (float_of_int running);
@@ -235,23 +179,44 @@ module Engine = struct
     Prometheus.Gauge.set (Metrics.pipeline_stage_total "blocked") (float_of_int blocked)
 end
 
-module Monitor : sig
-  val create :
-    read:(unit -> 'a or_error Lwt.t) ->
-    watch:((unit -> unit) -> (unit -> unit Lwt.t) Lwt.t) ->
-    pp:(Format.formatter -> unit) ->
-    'a Input.t
-end = struct
+module Var (T : Current_term.S.T) = struct
+  type t = {
+    current : T.t Current_term.Output.t Current_incr.var;
+    name : string;
+  }
+
+  let create ~name current =
+    let current = Current_incr.var current in
+    { current; name }
+
+  let get t =
+    let open Syntax in
+    component "%s" t.name |>
+    let> () = return () in
+    Current_incr.of_cc begin
+      Current_incr.read (Current_incr.of_var t.current) @@ fun v ->
+      Current_incr.write (v, None)
+    end
+
+  let set t v =
+    Current_incr.change t.current v;
+    Engine.update ()
+
+  let update t f =
+    Current_incr.change t.current (f (Current_incr.observe (Current_incr.of_var t.current)));
+    Engine.update ()
+end
+
+module Monitor = struct
   type 'a t = {
     read : unit -> 'a or_error Lwt.t;
     watch : (unit -> unit) -> (unit -> unit Lwt.t) Lwt.t;
     pp : Format.formatter -> unit;
-    mutable value : 'a Current_term.Output.t;
+    value : 'a Current_term.Output.t Current_incr.var;
     mutable ref_count : int;              (* Number of terms using this input *)
     mutable need_refresh : bool;          (* Update detected after current read started *)
     mutable active : bool;                (* Monitor thread is running *)
     cond : unit Lwt_condition.t;          (* Maybe time to leave the "wait" state *)
-    external_cond : unit Lwt_condition.t; (* New value ready for external user *)
   }
 
   let refresh t () =
@@ -266,58 +231,55 @@ end = struct
     unwatch () >>= fun () ->
     if t.ref_count > 0 then enable t
     else (
-      assert (t.active);
+      assert t.active;
       t.active <- false;
       (* Clear the saved value, so that if we get activated again then we don't
          start by serving up the previous value, which could be quite stale by then. *)
-      t.value <- Error (`Active `Running);
+      Current_incr.change t.value @@ Error (`Active `Running);
       Lwt.return `Finished
     )
   and get_value ~unwatch t =
     t.need_refresh <- false;
     t.read () >>= fun v ->
-    t.value <- (v :> _ Current_term.Output.t);
-    Lwt_condition.broadcast t.external_cond ();
+    Current_incr.change t.value @@ (v :> _ Current_term.Output.t);
+    Engine.update ();
     wait ~unwatch t
   and wait ~unwatch t =
     if t.ref_count = 0 then disable ~unwatch t
     else if t.need_refresh then get_value ~unwatch t
     else Lwt_condition.wait t.cond >>= fun () -> wait ~unwatch t
 
-  let run t =
-    Input.of_fn @@ fun _env ->
-    t.ref_count <- t.ref_count + 1;
-    if not t.active then (
-      t.active <- true;
-      Lwt.async (fun () -> enable t >|= fun `Finished -> ())
-    );  (* (else the previous thread will check [ref_count] before exiting) *)
-    let changed = Lwt_condition.wait t.external_cond in
-    t.value, Input.metadata ~changed @@
-    object
-      method cancel = None
-      method rebuild = None   (* Might be useful to implement this *)
-      method pp f = t.pp f
-      method release =
-        assert (t.ref_count > 0);
-        t.ref_count <- t.ref_count - 1;
-        if t.ref_count = 0 then Lwt_condition.broadcast t.cond ()
+  let input t =
+    Current_incr.of_cc begin
+      t.ref_count <- t.ref_count + 1;
+      Engine.on_disable (fun () ->
+          assert (t.ref_count > 0);
+          t.ref_count <- t.ref_count - 1;
+          if t.ref_count = 0 then Lwt_condition.broadcast t.cond ()
+        );
+      if not t.active then (
+        t.active <- true;
+        Lwt.async (fun () ->
+            (* [pause] to ensure we're outside of any existing propagate here. *)
+            Lwt.pause () >>= fun () ->
+            enable t >|= fun `Finished -> ()
+          )
+      );  (* (else the previous thread will check [ref_count] before exiting) *)
+      Current_incr.read (Current_incr.of_var t.value) @@ fun value ->
+      Current_incr.write (value, None)
     end
 
   let create ~read ~watch ~pp =
     let cond = Lwt_condition.create () in
-    let external_cond = Lwt_condition.create () in
-    let t = {
+    {
       ref_count = 0;
       active = false;
       need_refresh = true;
-      cond; external_cond;
-      value = Error (`Active `Running);
+      cond;
+      value = Current_incr.var (Error (`Active `Running));
       read; watch; pp
-    } in
-    run t
+    }
 end
-
-let monitor = Monitor.create
 
 module Level = Level
 
@@ -346,8 +308,30 @@ end
 let state_dir = Disk_store.state_dir
 
 module Db = Db
-module Job = Job
 module Process = Process
 module Switch = Switch
 module Pool = Pool
 module Log_matcher = Log_matcher
+
+module Job = struct
+  include Job
+
+  let register_actions job_id actions =
+    let add = function
+      | None -> Some [actions]
+      | Some xs -> Some (actions :: xs)
+    in
+    let remove xs =
+      let rec aux = function
+        | [] -> assert false
+        | x :: xs when x == actions -> xs
+        | x :: xs -> x :: aux xs
+      in
+      match aux (Option.get xs) with
+      | [] -> None
+      | xs -> Some xs
+    in
+    Engine.active_jobs := Job.Map.update job_id add !Engine.active_jobs;
+    Engine.on_disable @@ fun () ->
+    Engine.active_jobs := Job.Map.update job_id remove !Engine.active_jobs
+end
