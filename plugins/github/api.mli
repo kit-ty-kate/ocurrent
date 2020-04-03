@@ -21,6 +21,7 @@ end
 
 module Ref : sig
   type t = [ `Ref of string | `PR of int ]
+  val compare : t -> t -> int
   val pp : t Fmt.t
   val to_git : t -> string
 end
@@ -31,7 +32,7 @@ type t
 val of_oauth : string -> t
 val exec_graphql : ?variables:(string * Yojson.Safe.t) list -> t -> string -> Yojson.Safe.t Lwt.t
 val head_commit : t -> Repo_id.t -> Commit.t Current.t
-val refs : t -> Repo_id.t -> Commit.t Ref_map.t Current.Input.t
+val refs : t -> Repo_id.t -> Commit.t Ref_map.t Current.Primitive.t
 val head_of : t -> Repo_id.t -> [ `Ref of string | `PR of int ] -> Commit.t Current.t
 val ci_refs : t -> Repo_id.t -> Commit.t list Current.t
 val cmdliner : t Cmdliner.Term.t
@@ -64,8 +65,8 @@ type token = {
 val get_token : t -> (string, [`Msg of string]) result Lwt.t
 (** [get_token t] returns the cached token for [t], or fetches a new one if it has expired. *)
 
-val input_webhook : unit -> unit
-(** Call this when we get a webhook event. *)
+val input_webhook : Yojson.Safe.t -> unit
+(** Call this when we get a "pull_request", "push" or "create" webhook event. *)
 
 val v : get_token:(unit -> token Lwt.t) -> string -> t
 (** [v ~get_token account] is a configuration that uses [get_token] when it needs to get or refresh the API token.

@@ -9,6 +9,12 @@ type stats = {
 }
 (** Counters showing how many pipeline stages are in each state. *)
 
+type 'j link = [
+  | `Collapse of string * string        (* [Collapse (k, v) is a link to the same page
+                                           with "?k=v" added to the environment. *)
+  | `Job of 'j                          (* [Job id] link to the job with ID [id]. *)
+]
+
 module type T = sig
   type t
   val equal : t -> t -> bool
@@ -20,41 +26,31 @@ module type ORDERED = sig
   val pp : t Fmt.t
 end
 
-module type INPUT = sig
-  type 'a t
-  (** An input that was used while evaluating a term.
-      If the input changes, the term should be re-evaluated. *)
-
-  type job_id
-
-  val get : 'a t -> ('a Output.t * job_id option) Current_incr.t
-end
-
 module type ANALYSIS = sig
   type 'a term
   (** See [TERM]. *)
 
-  type job_id
+  type metadata
+  (** Extra data provided by primitives but that isn't part of the value that is
+      passed on to other nodes. For example, a job ID. *)
 
-  val job_id : 'a term -> job_id option term
-  (** [job_id t] is the job ID of [t], if any.
+  val metadata : 'a term -> metadata option term
+  (** [metadata t] is the metadata of [t], if any.
       Raises an exception if [t] is not a primitive (or a map of one). *)
 
   val pp : _ term Fmt.t
   (** [pp] formats a [t] as a simple string. *)
 
-  val pp_dot : url:(job_id -> string option) -> _ term Fmt.t
-  (** [pp_dot ~url] formats a [t] as a graphviz dot graph.
-      @param url Generates a URL from an ID. *)
+  val pp_dot : env:(string * string) list -> url:(metadata link -> string option) -> _ term Fmt.t
+  (** [pp_dot ~env ~url] formats a [t] as a graphviz dot graph.
+      @param env A list of key-value pairs from the URL to control rendering.
+      @param url Generates URLs for links. *)
 
   val stats : _ term -> stats
   (** [stats t] count how many stages are in each state. *)
 end
 
 module type TERM = sig
-  type 'a input
-  (** See [INPUT]. *)
-
   type 'a t
   (** An ['a t] is a term that produces a value of type ['a]. *)
 
@@ -101,13 +97,14 @@ module type TERM = sig
   (** [pair a b] is the pair containing the results of evaluating [a] and [b]
       (in parallel). *)
 
-  val list_map : (module ORDERED with type t = 'a) -> ('a t -> 'b t) -> 'a list t -> 'b list t
+  val list_map : (module ORDERED with type t = 'a) -> ?collapse_key:string -> ('a t -> 'b t) -> 'a list t -> 'b list t
   (** [list_map (module T) f xs] adds [f] to the end of each input term
       and collects all the results into a single list.
       @param T Used to display labels for each item, and to avoid recreating pipelines
-               unnecessarily. *)
+               unnecessarily.
+      @param collapse_key If given, each element is wrapped with [collapse]. *)
 
-  val list_iter : (module ORDERED with type t = 'a) -> ('a t -> unit t) -> 'a list t -> unit t
+  val list_iter : (module ORDERED with type t = 'a) -> ?collapse_key:string -> ('a t -> unit t) -> 'a list t -> unit t
   (** Like [list_map] but for the simpler case when the result is unit. *)
 
   val list_seq : 'a t list -> 'a list t
@@ -134,6 +131,24 @@ module type TERM = sig
   val gate : on:unit t -> 'a t -> 'a t
   (** [gate ~on:ctrl x] is the same as [x], once [ctrl] succeeds. *)
 
+  (** {2 Diagram control} *)
+
+  val collapse : key:string -> value:string -> input:_ t -> 'a t -> 'a t
+  (** [collapse ~key ~value ~input t] is a term that behaves just like [t], but
+      when shown in a diagram it can be expanded or collapsed. When collapsed,
+      it is shown as "input -> [+]" and the user can expand it to show [t]
+      instead. The idea is that [input] is a dependency of [t] and the "+"
+      represents everything in [t] after that. [key] and [value] are used
+      as the parameters (e.g. in a URL) to control whether this is expanded or
+      not. For example
+      [collapse ~key:"repo" ~value:"mirage/mirage-www" ~input:repo (process repo)]
+      Note: [list_map ~collapse_key] provides an easy way to use this. *)
+
+  val with_context : _ t -> (unit -> 'a t) -> 'a t
+  (** [with_context ctx f] is the term [f ()], where [f] is evaluated in
+      context [ctx]. This means that [ctx] will be treated as an input to all
+      terms created by [f] in the diagrams. *)
+
   (** {2 Monadic operations} *)
 
   (** {b N.B.} these operations create terms that cannot be statically
@@ -145,7 +160,14 @@ module type TERM = sig
       [x] is ready, so using [bind] makes static analysis less useful. You can
       use the [info] argument to provide some information here. *)
 
-  val primitive : info:description -> ('a -> 'b input) -> 'a t -> 'b t
+  (** {2 Primitives} *)
+
+  type metadata
+  (** See [ANALYSIS]. *)
+
+  type 'a primitive
+
+  val primitive : info:description -> ('a -> 'b primitive) -> 'a t -> 'b t
   (** [primitive ~info f x] is a term that evaluates [f] on each new value of [x].
       This is used to provide the primitive operations, which can then be
       combined using the other combinators in this module.
@@ -174,7 +196,7 @@ module type TERM = sig
         be determined at runtime by looking at the concrete value. Static
         analysis cannot predict what this will do until the input is ready. *)
 
-    val (let>) : 'a t -> ('a -> 'b input) -> description -> 'b t
+    val (let>) : 'a t -> ('a -> 'b primitive) -> description -> 'b t
     (** [let>] is used to define a component. e.g.:
         {[
           component "my-op" |>

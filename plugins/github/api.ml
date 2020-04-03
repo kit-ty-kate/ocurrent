@@ -4,11 +4,25 @@ open Current.Syntax
 (* Limit updates to one at a time for now. *)
 let pool = Current.Pool.create ~label:"github" 1
 
-(* Currently, this fires whenever we get an incoming web-hook.
-   Ideally, it would be more fine-grained. *)
-let webhook_cond = Lwt_condition.create ()
+(* When we get a webhook event, we fire the condition for that repository `owner/name`, if any. *)
+let webhook_cond = Hashtbl.create 10
 
-let input_webhook () = Lwt_condition.broadcast webhook_cond ()
+let await_event ~owner_name =
+  let cond =
+    match Hashtbl.find_opt webhook_cond owner_name with
+    | Some c -> c
+    | None ->
+      let c = Lwt_condition.create () in
+      Hashtbl.add webhook_cond owner_name c;
+      c
+  in
+  Lwt_condition.wait cond
+
+let input_webhook body =
+  let owner_name = Yojson.Safe.Util.(body |> member "repository" |> member "full_name" |> to_string) in
+  match Hashtbl.find_opt webhook_cond owner_name with
+  | Some cond -> Lwt_condition.broadcast cond ()
+  | None -> Log.info (fun f -> f "Got webhook event for %S, but we're not interested in that" owner_name)
 
 module Metrics = struct
   open Prometheus
@@ -273,14 +287,15 @@ let make_head_commit_monitor t repo =
       (fun ex -> Lwt_result.fail @@ `Msg (Fmt.strf "GitHub query for %a failed: %a" Repo_id.pp repo Fmt.exn ex))
   in
   let watch refresh =
+    let owner_name = Printf.sprintf "%s/%s" repo.owner repo.name in
     let rec aux x =
       x >>= fun () ->
-      let x = Lwt_condition.wait webhook_cond in
+      let x = await_event ~owner_name in
       refresh ();
       Lwt_unix.sleep 10.0 >>= fun () ->   (* Limit updates to 1 per 10 seconds *)
       aux x
     in
-    let x = Lwt_condition.wait webhook_cond in
+    let x = await_event ~owner_name in
     let thread =
       Lwt.catch
         (fun () -> aux x)
@@ -305,7 +320,7 @@ let head_commit t repo =
       t.head_monitors <- Repo_map.add repo i t.head_monitors;
       i
   in
-  Current.Monitor.input monitor
+  Current.Monitor.get monitor
 
 let query_branches_and_open_prs = {|
   query($owner: String!, $name: String!) {
@@ -396,14 +411,15 @@ let make_ci_refs_monitor t repo =
       (fun ex -> Lwt_result.fail @@ `Msg (Fmt.strf "GitHub query for %a failed: %a" Repo_id.pp repo Fmt.exn ex))
   in
   let watch refresh =
+    let owner_name = Printf.sprintf "%s/%s" repo.owner repo.name in
     let rec aux x =
       x >>= fun () ->
-      let x = Lwt_condition.wait webhook_cond in
+      let x = await_event ~owner_name in
       refresh ();
       Lwt_unix.sleep 10.0 >>= fun () ->   (* Limit updates to 1 per 10 seconds *)
       aux x
     in
-    let x = Lwt_condition.wait webhook_cond in
+    let x = await_event ~owner_name in
     let thread =
       Lwt.catch
         (fun () -> aux x)
@@ -418,7 +434,7 @@ let make_ci_refs_monitor t repo =
   Current.Monitor.create ~read ~watch ~pp
 
 let refs t repo =
-  Current.Monitor.input (
+  Current.Monitor.get (
     match Repo_map.find_opt repo t.ci_refs_monitors with
     | Some i -> i
     | None ->
@@ -445,7 +461,7 @@ let head_of t repo id =
   Current.component "%a@,%a" Repo_id.pp repo Ref.pp id |>
   let> () = Current.return () in
   refs t repo
-  |> Current.Input.map_result @@ function
+  |> Current.Primitive.map_result @@ function
   | Error _ as e -> e
   | Ok refs ->
     match Ref_map.find_opt id refs with
@@ -561,7 +577,7 @@ module Repo = struct
   let head_commit t =
     Current.component "head" |>
     let> (api, repo) = t in
-    Current.Monitor.input (
+    Current.Monitor.get (
       match Repo_map.find_opt repo api.head_monitors with
       | Some i -> i
       | None ->

@@ -1,10 +1,12 @@
 module S = S
 module Output = Output
 
-module Make (Input : S.INPUT) = struct
+module Make (Metadata : sig type t end) = struct
   type description = string
 
-  module Node = Node.Make(Input)
+  type 'a primitive = ('a Output.t * Metadata.t option) Current_incr.t
+
+  module Node = Node.Make(Metadata)
   open Node
 
   type 'a t = 'a Node.t
@@ -84,15 +86,15 @@ module Make (Input : S.INPUT) = struct
       Current_incr.write @@ Dyn.pair a b
     end
 
-  let primitive ~info (f:'a -> 'b Input.t) (x:'a t) =
+  let primitive ~info (f:'a -> 'b primitive) (x:'a t) =
     let id = Id.mint () in
     let v_meta =
       Current_incr.of_cc begin
         Current_incr.read x.v @@ function
         | Error _ as e -> Current_incr.write (e, None)
         | Ok y ->
-          let input = f y in
-          Current_incr.read (Input.get input) @@ fun (v, job) ->
+          let output = f y in
+          Current_incr.read output @@ fun (v, job) ->
           Current_incr.write (with_id id v, job)
       end
     in
@@ -114,6 +116,12 @@ module Make (Input : S.INPUT) = struct
   end
 
   open Syntax
+
+  let collapse ~key ~value ~input t =
+    node (Collapse { key; value; input = Term input; output = Term t }) t.v
+
+  let with_context ctx f =
+    with_bind_context (Term ctx) f
 
   let rec all = function
     | [] -> return ()
@@ -181,7 +189,7 @@ module Make (Input : S.INPUT) = struct
       y :: ys
 
 
-  let list_map (type a) (module M : S.ORDERED with type t = a) (f : a t -> 'b t) (input : a list t) =
+  let list_map (type a) (module M : S.ORDERED with type t = a) ?collapse_key (f : a t -> 'b t) (input : a list t) =
     let module Map = Map.Make(M) in
     let module Sep = Current_incr.Separate(Map) in
     (* Stage 1 : convert input list to a set.
@@ -196,8 +204,12 @@ module Make (Input : S.INPUT) = struct
        not on every change to the set. *)
     let results =
       Sep.map as_map @@ fun item ->
-      let label = Ok (Fmt.to_to_string M.pp item) in
-      Current_incr.write (f (map_input ~label input (Ok item)))
+      let label = Fmt.to_to_string M.pp item in
+      let input = map_input ~label:(Ok label) input (Ok item) in
+      let output = f input in
+      match collapse_key with
+      | None -> Current_incr.write output
+      | Some key -> Current_incr.write (collapse ~key ~value:label ~input output)
     in
     (* Stage 3 : combine results.
        This runs whenever either the set of results changes, or the input list changes
@@ -224,8 +236,8 @@ module Make (Input : S.INPUT) = struct
     let output = Current_incr.map (fun x -> Term x) results in
     node (List_map { items = Term input; output }) (join results)
 
-  let list_iter (type a) (module M : S.ORDERED with type t = a) f (xs : a list t) =
-    let+ (_ : unit list) = list_map (module M) f xs in
+  let list_iter (type a) (module M : S.ORDERED with type t = a) ?collapse_key f (xs : a list t) =
+    let+ (_ : unit list) = list_map (module M) ?collapse_key f xs in
     ()
 
   let option_seq : 'a t option -> 'a option t = function
@@ -248,15 +260,15 @@ module Make (Input : S.INPUT) = struct
   end
 
   module Analysis = struct
-    include Analysis.Make(Input)
+    include Analysis.Make(Metadata)
 
     (* This is a bit of a hack. *)
-    let job_id t =
+    let metadata t =
       let rec aux (Term t) =
         match t.ty with
         | Primitive p -> p.meta
         | Map t -> aux t
-        | _ -> failwith "job_id: this is not a job term!"
+        | _ -> failwith "metadata: this is not a primitive term!"
       in
       node (Constant None) @@ Current_incr.map Result.ok @@ aux (Term t)
   end
