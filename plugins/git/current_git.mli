@@ -40,12 +40,14 @@ val clone : schedule:Current_cache.Schedule.t -> ?gref:string -> string -> Commi
 val fetch : Commit_id.t Current.t -> Commit.t Current.t
 
 val with_checkout :
+  ?enable_submodules:bool ->
   job:Current.Job.t ->
   Commit.t ->
   (Fpath.t -> 'a Current.or_error Lwt.t) ->
   'a Current.or_error Lwt.t
-(** [with_checkout ~job c fn] clones [c] to a temporary directory and runs [fn tmpdir].
-    When it returns, the directory is deleted. *)
+(** [with_checkout ?enable_submodules ~job c fn] clones [c] to a temporary directory and runs [fn tmpdir].
+    When it returns, the directory is deleted.
+    [enable_submodules] is [true] by default. If it is [true], the all git submodule will be also be pulled. *)
 
 module Local : sig
   type t

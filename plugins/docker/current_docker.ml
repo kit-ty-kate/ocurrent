@@ -29,7 +29,7 @@ module Make (Host : S.HOST) = struct
     | `No_context -> Current.return `No_context
     | `Git commit -> Current.map (fun x -> `Git x) commit
 
-  let build ?schedule ?timeout ?(squash=false) ?label ?dockerfile ?pool ?(build_args=[]) ~pull src =
+  let build ?enable_submodules ?schedule ?timeout ?(squash=false) ?label ?dockerfile ?pool ?(build_args=[]) ~pull src =
     Current.component "build%a" pp_sp_label label |>
     let> commit = get_build_context src
     and> dockerfile = Current.option_seq dockerfile in
@@ -39,7 +39,7 @@ module Make (Host : S.HOST) = struct
       | Some (`File _ as f) -> f
       | Some (`Contents c) -> `Contents (Dockerfile.string_of_t c)
     in
-    BC.get ?schedule { Build.pull; pool; timeout }
+    BC.get ?schedule { Build.pull; pool; timeout; enable_submodules }
       { Build.Key.commit; dockerfile; docker_context; squash; build_args }
 
   module RC = Current_cache.Make(Run)

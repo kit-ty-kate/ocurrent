@@ -4,6 +4,7 @@ type t = {
   pull : bool;
   pool : Current.Pool.t option;
   timeout : Duration.t option;
+  enable_submodules : bool option;
 }
 
 let id = "docker-build"
@@ -55,12 +56,12 @@ let or_raise = function
   | Ok () -> ()
   | Error (`Msg m) -> raise (Failure m)
 
-let with_context ~job context fn =
+let with_context ?enable_submodules ~job context fn =
   match context with
   | `No_context -> Current.Process.with_tmpdir ~prefix:"build-context-" fn
-  | `Git commit -> Current_git.with_checkout ~job commit fn
+  | `Git commit -> Current_git.with_checkout ?enable_submodules ~job commit fn
 
-let build { pull; pool; timeout } job key =
+let build { pull; pool; timeout; enable_submodules } job key =
   let { Key.commit; docker_context; dockerfile; squash; build_args } = key in
   begin match dockerfile with
     | `Contents contents ->
@@ -68,7 +69,7 @@ let build { pull; pool; timeout } job key =
     | `File _ -> ()
   end;
   Current.Job.start ?timeout ?pool job ~level:Current.Level.Average >>= fun () ->
-  with_context ~job commit @@ fun dir ->
+  with_context ?enable_submodules ~job commit @@ fun dir ->
   let file =
     match dockerfile with
     | `Contents contents ->

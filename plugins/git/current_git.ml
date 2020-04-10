@@ -72,7 +72,7 @@ let strip_heads gref =
   else
     gref
 
-let with_checkout ~job commit fn =
+let with_checkout ?(enable_submodules=true) ~job commit fn =
   let { Commit.repo; id } = commit in
   let short_hash = Astring.String.with_range ~len:8 id.Commit_id.hash in
   Current.Job.log job "@[<v2>Checking out commit %s. To reproduce:@,git clone --recursive %S -b %S && cd %S && git reset --hard %s@]"
@@ -85,7 +85,11 @@ let with_checkout ~job commit fn =
   Cmd.cp_r ~cancellable:true ~job ~src:(Fpath.(repo / ".git")) ~dst:tmpdir >>!= fun () ->
   Cmd.git_reset_hard ~job ~repo:tmpdir id.Commit_id.hash >>= function
   | Ok () ->
-    Cmd.git_submodule_update ~cancellable:true ~job ~repo:tmpdir >>!= fun () ->
+    (if enable_submodules then
+       Cmd.git_submodule_update ~cancellable:true ~job ~repo:tmpdir
+     else
+       Lwt.return (Ok ())
+    ) >>!= fun () ->
     fn tmpdir
   | Error e ->
     Commit.check_cached ~cancellable:false ~job commit >>= function
