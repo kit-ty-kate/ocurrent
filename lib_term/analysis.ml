@@ -189,10 +189,17 @@ module Make (Meta : sig type t end) = struct
               | Constant None -> Out_node.empty
               | _ -> aux x
             in
-            begin match name with Some name -> node i name | None -> () end;
-            let all_inputs = Out_node.union inputs ctx in
-            Out_node.connect (edge_to i) all_inputs;
-            Out_node.singleton ~deps:all_inputs.Out_node.trans i
+            begin match name, v with
+              | Some _, _ | _, Error (_, `Msg _) when error_from_self ->
+                (* Normally, we don't show separate boxes for map functions.
+                   But we do if one fails. *)
+                node i (Option.value ~default:"bind" name);
+                let all_inputs = Out_node.union inputs ctx in
+                Out_node.connect (edge_to i) all_inputs;
+                Out_node.singleton ~deps:all_inputs.Out_node.trans i
+              | _, _ ->
+                inputs
+            end
           | Bind_out x -> aux (Current_incr.observe x)
           | Primitive {x; info; meta} ->
             let inputs =
