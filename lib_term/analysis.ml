@@ -29,7 +29,8 @@ module Make (Meta : sig type t end) = struct
         | Map_input { source = _; info = Error `Blocked } -> Fmt.string f "(blocked)"
         | Map_input { source = _; info = Error `Empty_list } -> Fmt.string f "(empty list)"
         | Opt_input { source } -> Fmt.pf f "[%a]" aux source
-        | Bind_in (x, name) -> Fmt.pf f "%a@;>>=@;%s" aux x name
+        | Bind_in (x, Some name) -> Fmt.pf f "%a@;>>=@;%s" aux x name
+        | Bind_in (x, None) -> Fmt.pf f "%a@;>>=@" aux x
         | Bind_out x -> aux f (Current_incr.observe x)
         | Primitive {x; info; meta = _ } -> Fmt.pf f "%a@;>>=@;%s" aux x info
         | Pair (x, y) -> Fmt.pf f "@[<v>@[%a@]@,||@,@[%a@]@]" aux x aux y
@@ -188,7 +189,7 @@ module Make (Meta : sig type t end) = struct
               | Constant None -> Out_node.empty
               | _ -> aux x
             in
-            node i name;
+            begin match name with Some name -> node i name | None -> () end;
             let all_inputs = Out_node.union inputs ctx in
             Out_node.connect (edge_to i) all_inputs;
             Out_node.singleton ~deps:all_inputs.Out_node.trans i

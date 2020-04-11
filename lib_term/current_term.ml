@@ -57,7 +57,7 @@ module Make (Metadata : sig type t end) = struct
       Current_incr.read y.v Current_incr.write
     end
 
-  let bind ?(info="") (f:'a -> 'b t) (x:'a t) =
+  let bind ?info (f:'a -> 'b t) (x:'a t) =
     let bind_in = node (Bind_in (Term x, info)) x.v in
     let t =
       x.v |> Current_incr.map @@ fun v ->

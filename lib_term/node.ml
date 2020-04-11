@@ -14,7 +14,7 @@ module Make (Metadata : sig type t end) = struct
     | State of { source : generic; hidden : bool }
     | Catch of { source : generic; hidden : bool }
     | Map of generic
-    | Bind_in of generic * string
+    | Bind_in of generic * string option
     | Bind_out of generic Current_incr.t
     | Primitive of {x : generic; info : string; meta : Metadata.t option Current_incr.t }
     | Pair of generic * generic
