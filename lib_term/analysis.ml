@@ -251,7 +251,7 @@ module Make (Meta : sig type t end) = struct
                 Out_node.connect (edge_to i) all_inputs;
                 Out_node.singleton ~deps:all_inputs.Out_node.trans i
               | _ ->
-                aux x
+                inputs
             end
           | List_map { items; output } ->
             ignore (aux items);
