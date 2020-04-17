@@ -1,8 +1,101 @@
-type webhook = string * (Cohttp_lwt.Request.t -> Cohttp_lwt.Body.t -> (Cohttp.Response.t * Cohttp_lwt.Body.t) Lwt.t)
-(** A webhook is a [(name, handler)] pair. *)
+module User : sig
+  type t
+  (** Information about a site user. *)
 
-val run : ?mode:Conduit_lwt_unix.server -> ?webhooks:webhook list -> Current.Engine.t -> ('a, [`Msg of string]) result Lwt.t
-(** [run ~mode engine] runs a web-server (with configuration [mode]) showing the state of [engine].
-    @param webhooks A list of [name, handler] pairs. Requests to ["/webhook/$name"] are sent to [handler]. *)
+  val v : string -> (t, [> `Msg of string]) result
+  (** [v id] is a user with ID [id]. *)
+
+  val id : t -> string
+  (** [id t] is the user ID (e.g. "github:alice") *)
+end
+
+module Role : sig
+  type t = [
+    | `Viewer   (* Read-only access, suitable for the general public. *)
+    | `Builder  (* Can cancel and rebuild jobs. *)
+    | `Monitor  (* Can read the metrics. *)
+    | `Admin    (* Can manage log matcher rules. *)
+  ]
+
+  val pp : t Fmt.t
+end
+
+module Site : sig
+  type t
+  (** Site configuration settings. *)
+
+  val allow_all : (User.t option -> Role.t -> bool)
+  (** [allow_all] grants every role to every user. *)
+
+  val v :
+    ?name:string ->
+    ?authn:(csrf:string -> Uri.t) ->
+    ?secure_cookies:bool ->
+    has_role:(User.t option -> Role.t -> bool) ->
+    unit -> t
+  (** [v ~name ~authn ~has_role ()] is a site named [name] (used for the HTML title, etc)
+      that uses [authn] to authenticate users and [has_role] to control what they can do.
+      @param authn A link to a login page.
+      @param secure_cookies Set secure cookie attribute (turn on if public site uses https). *)
+end
+
+module Context : sig
+  type t
+  (** The context of a single web request. *)
+
+  val of_request : site:Site.t -> Cohttp.Request.t -> t Lwt.t
+
+  val request : t -> Cohttp.Request.t
+
+  val csrf : t -> string
+  (** [csrf t] is the user's CSRF token to include in POST forms. *)
+
+  val set_user : t -> User.t -> (Cohttp.Response.t * Cohttp_lwt.Body.t) Lwt.t
+  (** [set_user t user] records a successful login by [user] and redirects the
+      user back to the page they came from. *)
+
+  val respond_ok : t -> [< Html_types.div_content_fun ] Tyxml.Html.elt list -> (Cohttp.Response.t * Cohttp_lwt.Body.t) Lwt.t
+  (** [respond_ok ctx content] returns a successful page with [content] inserted into the site template. *)
+
+  val respond_redirect : t -> Uri.t -> (Cohttp.Response.t * Cohttp_lwt.Body.t) Lwt.t
+  (** [respond_redirect ctx uri] redirects the user to [uri]. *)
+
+  val respond_error : t -> Cohttp.Code.status_code -> string -> (Cohttp.Response.t * Cohttp_lwt.Body.t) Lwt.t
+  (** [respond_error ctx code msg] returns an error message to the user, inside the site template. *)
+end
+
+module Resource : sig
+  (* A single HTTP resource in the web UI. *)
+  class virtual t : object
+    val can_get : Role.t
+    (** The role the client needs in order to make a GET request. *)
+
+    val can_post : Role.t
+    (** The role the client needs in order to make a POST request. *)
+
+    method private get : Context.t -> (Cohttp.Response.t * Cohttp_lwt.Body.t) Lwt.t
+    (** Concrete resources should override this method to handle GET requests.
+        The default method returns a [`Bad_request] error. *)
+
+    method private post : Context.t -> string -> (Cohttp.Response.t * Cohttp_lwt.Body.t) Lwt.t
+    (** Concrete resources should override this method to handle POSTs.
+        The default method returns a [`Bad_request] error. *)
+
+    method get_raw : Site.t -> Cohttp.Request.t -> (Cohttp.Response.t * Cohttp_lwt.Body.t) Lwt.t
+    (** Handle an HTTP GET request. The default method checks that the caller
+        has the {!can_get} role and then calls [get]. *)
+
+    method post_raw : Site.t -> Cohttp.Request.t -> Cohttp_lwt.Body.t -> (Cohttp.Response.t * Cohttp_lwt.Body.t) Lwt.t
+    (** Handle an HTTP POST request.
+        The default method checks that the caller has the {!can_post} role,
+        reads the body, checks the CSRF token, and then calls [post]. *)
+  end
+end
+
+val routes : Current.Engine.t -> Resource.t Routes.route list
+(** [routes engine] is the default routes for a web interface to [engine]. *)
+
+val run : ?mode:Conduit_lwt_unix.server -> site:Site.t -> Resource.t Routes.route list -> ('a, [`Msg of string]) result Lwt.t
+(** [run ~mode ~site routes] runs a web-server (with configuration [mode]) that handles incoming requests with [routes]. *)
 
 val cmdliner : Conduit_lwt_unix.server Cmdliner.Term.t

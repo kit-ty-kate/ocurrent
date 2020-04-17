@@ -19,6 +19,10 @@ depends: [
   "current" {= version}
   "current_ansi" {= version}
   "ocaml" {>= "4.08.0"}
+  "base64"
+  "session"
+  "session-cohttp-lwt"
+  "mirage-crypto-rng"
   "fmt"
   "bos"
   "lwt"
@@ -27,5 +31,5 @@ depends: [
   "cohttp-lwt-unix" {>= "2.2.0"}
   "tyxml"
   "routes" {>= "0.7.0"}
-  "dune" {>= "1.9"}
+  "dune" {>= "2.0"}
 ]

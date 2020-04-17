@@ -1,7 +1,7 @@
 (** Integration with GitHub. *)
 
-val input_webhook : Cohttp_lwt.Request.t -> Cohttp_lwt.Body.t -> (Cohttp.Response.t * Cohttp_lwt.Body.t) Lwt.t
-(** Call this whenever an HTTP request is received on the web-hook endpoint. *)
+val webhook : Current_web.Resource.t
+(** Our web-hook endpoint. This must be added to {!Current_web.routes} so that we get notified of events. *)
 
 module Repo_id : sig
   (** Identifies a repository hosted on GitHub. *)
@@ -143,4 +143,24 @@ module App : sig
 
   val installations : t -> Installation.t list Current.t
   (** [installations t] evaluates to the list of installations for this app. *)
+end
+
+(** Use GitHub to authenticate users. *)
+module Auth : sig
+  type t
+  (** Configuration for GitHub OAuth single-sign-on. *)
+
+  val v : ?scopes:string list -> client_id:string -> client_secret:string -> unit -> t
+  (** Create a configuration using the details provided by GitHub. *)
+
+  val make_login_uri : t -> csrf:string -> Uri.t
+  (** Use this as your [~authn] in {!Current_web.Site.v}. *)
+
+  val login : t option -> Current_web.Resource.t
+  (** The callback page for logins. Add a route to this from the URL you
+      configured when you set up your GitHub OAuth app.
+      If [t = None] then the page will tell you how to configure it. *)
+
+  val cmdliner : t option Cmdliner.Term.t
+  (** Get the configuration from the command-line. *)
 end

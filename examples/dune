@@ -3,6 +3,7 @@
                docker_service
                docker_custom
                build_matrix
+               auth
                github
                github_app
                rpc_server
@@ -32,4 +33,8 @@
    lwt.unix
    prometheus
    result
-   uri))
+   routes
+   uri
+   ppx_deriving_yojson.runtime
+   yojson)
+ (preprocess (pps ppx_deriving.std ppx_deriving_yojson)))
