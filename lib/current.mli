@@ -320,7 +320,7 @@ end
 (** Helper functions for spawning sub-processes. *)
 module Process : sig
   val exec :
-    ?stdin:string ->
+    ?cwd:Fpath.t -> ?stdin:string ->
     ?pp_error_command:(Format.formatter -> unit) ->
     cancellable:bool ->
     job:Job.t -> Lwt_process.command ->
