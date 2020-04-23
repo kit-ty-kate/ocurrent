@@ -50,7 +50,7 @@ let pp_duration_rough f d =
   in
   aux durations
 
-module Output(Op : S.PUBLISHER) = struct
+module Generic(Op : S.GENERIC) = struct
   module Outputs = Map.Make(String)
 
   module Value : sig
@@ -80,6 +80,9 @@ module Output(Op : S.PUBLISHER) = struct
     mutable autocancelled : bool;   (* This op is expected to fail *)
   }
 
+  type latched = (Op.Outcome.t, [`Msg of string]) result option
+  (** A previous outcome that can still be used while rebuilding. *)
+
   type output = {
     key : Op.Key.t;
     mutable build_number : int64;         (* Number of recorded (incl failed) builds with this key. *)
@@ -90,10 +93,10 @@ module Output(Op : S.PUBLISHER) = struct
     mutable desired : Value.t;            (* The value we want. *)
     mutable ctx : Op.t;                   (* The context for [desired]. *)
     mutable op : [
-      | `Active of op                     (* The currently-running operation. *)
+      | `Active of op * latched           (* The currently-running operation. *)
       | `Error of [`Msg of string]        (* Why [desired] isn't possible. *)
       | `Finished of Op.Outcome.t         (* Note: if current <> desired then rebuild. *)
-      | `Retry                            (* Need to try again. *)
+      | `Retry of latched                 (* Need to try again. *)
     ];
     mutable mtime : float;                (* Time last operation completed (if finished or error). *)
     mutable expires : (float * unit Lwt.t) option;     (* Time and sleeping thread (for cancellation). *)
@@ -125,7 +128,10 @@ module Output(Op : S.PUBLISHER) = struct
 
      The user can only ask to cancel while we are Active. They can only ask to Rebuild
      when Finished or Error.
-   *)
+
+     If we reach the scheduled time for a rebuild while in Finished or Error then
+     we also move to Retry, but we also continue reporting the previous result
+     while rebuilding. *)
 
   let pp_op f (k, v) = Op.pp f (k, Value.value v)
   let pp_desired f output = pp_op f (output.key, output.desired)
@@ -139,9 +145,9 @@ module Output(Op : S.PUBLISHER) = struct
       Fmt.pf f "%a: %s" pp_desired output msg
     | `Finished _ ->
       Fmt.pf f "%a (completed)" pp_desired output
-    | `Retry ->
+    | `Retry _ ->
       Fmt.pf f "%a (retry scheduled)" pp_desired output
-    | `Active op ->
+    | `Active (op, _) ->
       if Value.equal op.value output.desired then
         Fmt.pf f "%a (in-progress)" pp_op (output.key, op.value)
       else
@@ -152,9 +158,9 @@ module Output(Op : S.PUBLISHER) = struct
   (* Caller needs to notify about the change, if needed. *)
   let invalidate_output output =
     match output.op with
-    | `Finished _ | `Retry ->
+    | `Finished _ | `Retry _ ->
       output.current <- None;
-      output.op <- `Retry;
+      output.op <- `Retry None;
       Db.invalidate ~op:Op.id (Op.Key.digest output.key)
     | _ -> assert false
 
@@ -179,31 +185,32 @@ module Output(Op : S.PUBLISHER) = struct
       (* Already publishing something and we don't auto-cancel.
          When the stale push completes, we'll get called again. *)
       ()
-    | `Active op when Value.equal output.desired op.value ->
+    | `Active (op, _) when Value.equal output.desired op.value ->
       (* We're already working to set the desired value. Just keep going. *)
       ()
-    | `Active op ->
+    | `Active (op, _) ->
       assert Op.auto_cancel;
       Log.info (fun f -> f "Auto-cancelling %a" pp_op (output.key, op.value));
       op.autocancelled <- true;
       (* Cancel existing job. When that finishes, we'll get called again. *)
       Job.cancel op.job "Auto-cancelling job because it is no longer needed"
-    | `Retry ->
-        invalidate_output output;
-        publish ~config output
-    | `Finished _ ->
+    | `Retry latched ->
+        publish ~latched ~config output
+    | `Finished outcome ->
       match output.current with
       | Some current when current = Value.digest output.desired -> () (* Already the desired value. *)
       | _ ->
         (* Either we don't know the current state, or we know we want something different.
            We're not already running, and we haven't already failed. Time to publish! *)
-        (* Once we start publishing, we don't know the state: *)
-        invalidate_output output;
-        publish ~config output
+        let latched = if Op.latched then Some (Ok outcome) else None in
+        publish ~latched ~config output
   and maybe_restart ~config output =
     maybe_start ~config output;
     notify output
-  and publish ~config output =
+  and publish ~latched ~config output =
+    (* Once we start publishing, we don't know the state (it might be better to
+       wait until the job starts before doing this): *)
+    output.current <- None;
     let ctx = output.ctx in
     let switch = Current.Switch.create ~label:Op.id () in
     let job = Job.create ~switch ~label:Op.id ~config () in
@@ -211,7 +218,7 @@ module Output(Op : S.PUBLISHER) = struct
     output.job_id <- Some job_id;
     let op = { value = output.desired; job; autocancelled = false } in
     let ready = !Job.timestamp () |> Unix.gmtime in
-    output.op <- `Active op;
+    output.op <- `Active (op, latched);
     let pp_op f = pp_op f (output.key, op.value) in
     Job.log job "New job: %t" pp_op;
     Lwt.async
@@ -228,13 +235,13 @@ module Output(Op : S.PUBLISHER) = struct
          Lwt.finalize
            (fun () ->
               Lwt.catch
-                (fun () -> Op.publish ctx job output.key (Value.value op.value))
+                (fun () -> Op.run ctx job output.key (Value.value op.value))
                 (fun ex -> Lwt.return (Error (`Msg (Printexc.to_string ex))))
               >>= fun outcome ->
               Lwt.pause () >|= fun () ->        (* Ensure we're outside any propagate *)
               let end_time = Unix.gmtime @@ !Job.timestamp () in
               if op.autocancelled then (
-                output.op <- `Retry;
+                output.op <- `Retry latched;
                 invalidate_output output
               ) else (
                 (* Record the result *)
@@ -255,24 +262,26 @@ module Output(Op : S.PUBLISHER) = struct
                     | Some e -> Error (`Msg e)
                 in
                 output.mtime <- !Job.timestamp ();
-                begin match outcome with
-                  | Ok outcome ->
-                    output.current <- Some (Value.digest op.value);
-                    output.op <- `Finished outcome;
-                  | Error e ->
-                    (* If it failed but we have a new value to set, ignore the stale error. *)
-                    let retry = not (Value.equal op.value output.desired) in
-                    output.op <- if retry then `Retry else `Error e
-                end;
                 let job_id = Job.id job in
-                let outcome = Stdlib.Result.map Op.Outcome.marshal outcome in
                 Db.record ~op:Op.id ~job_id
                   ~key:key_digest
                   ~value:(Value.digest op.value)
                   ~ready ~running ~finished:end_time
                   ~build:output.build_number
-                  outcome;
+                  (Stdlib.Result.map Op.Outcome.marshal outcome);
                 output.build_number <- Int64.succ output.build_number;
+                match outcome with
+                | Ok outcome ->
+                  output.current <- Some (Value.digest op.value);
+                  output.op <- `Finished outcome;
+                | Error e ->
+                  if Value.equal op.value output.desired then (
+                    output.op <- `Error e
+                  ) else (
+                    (* It failed, but we have a new value to set: ignore the stale error. *)
+                    output.op <- `Retry None;
+                    invalidate_output output
+                  )
               )
            )
            (fun () ->
@@ -291,9 +300,21 @@ module Output(Op : S.PUBLISHER) = struct
       let thread =
         Lwt.catch
           (fun () ->
-             !Job.sleep remaining_time >>= fun () ->
+             begin
+               if remaining_time <= 0.0 then Lwt.return_unit
+               else !Job.sleep remaining_time
+             end
+             >>= fun () ->
+             Log.info (fun f -> f "Result for %a has expired" pp_desired t);
+             let latched =
+               match t.op with
+               | `Finished x -> Some (Ok x)
+               | `Retry x -> x
+               | _ -> None
+             in
+             t.op <- `Retry latched;
+             t.current <- None;
              Lwt.pause () >|= fun () ->        (* Ensure we're outside any propagate *)
-             invalidate t.key;
              let config = Option.get (Current_incr.observe Current.Config.now) in
              maybe_restart ~config t
           )
@@ -322,17 +343,18 @@ module Output(Op : S.PUBLISHER) = struct
     let current, job_id, op, mtime, build_number =
       match Db.lookup ~op:Op.id (Op.Key.digest key) with
       | Some { Db.value; job_id; outcome; finished; build; rebuild; _ } ->
-        let op = match outcome with
-          | _ when rebuild -> `Retry
-          | Error e -> `Error e
+        let current, op = match outcome with
+          | _ when rebuild -> None, `Retry None
+          | Error e -> Some value, `Error e
           | Ok outcome ->
-            try `Finished (Op.Outcome.unmarshal outcome)
+            try Some value, `Finished (Op.Outcome.unmarshal outcome)
             with ex ->
               Log.warn (fun f -> f "Failed to restore %S cached outcome: %a (will rebuild)" Op.id Fmt.exn ex);
-              `Retry
+              Db.invalidate ~op:Op.id (Op.Key.digest key);
+              None, `Retry None
         in
-        Some value, Some job_id, op, finished, Int64.succ build
-      | None -> None, None, `Retry, Unix.gettimeofday (), 0L
+        current, Some job_id, op, finished, Int64.succ build
+      | None -> None, None, `Retry None, Unix.gettimeofday (), 0L
     in
     let notify = Current_incr.var () in
     { key; current; desired; ctx; op; job_id; last_set = step_id;
@@ -347,8 +369,9 @@ module Output(Op : S.PUBLISHER) = struct
     | Some job_id ->
       let rebuild () =
         match o.op with
-        | `Finished _ | `Error _ | `Retry ->
-          o.op <- `Retry;
+        | `Finished _ | `Error _ | `Retry _ ->
+          o.op <- `Retry None;
+          invalidate_output o;
           maybe_restart ~config o;
           Option.get o.job_id
         | `Active _ ->
@@ -363,17 +386,11 @@ module Output(Op : S.PUBLISHER) = struct
         end
       | Some duration ->
         let expires = Duration.to_f duration +. o.mtime in
-        let remaining_time = expires -. !Job.timestamp () in
-        if remaining_time <= 0.0 then (
-          Log.info (fun f -> f "Result for %a has expired" pp_op (key, value));
-          invalidate key;
-          notify o   (* Trigger an immediate recalculation *)
-        ) else (
-          limit_expires o expires
-        );
+        limit_expires o expires;
         Current.Job.register_actions job_id @@
         object
           method pp f =
+            let remaining_time = expires -. !Job.timestamp () in
             if remaining_time <= 0.0 then
               Fmt.pf f "%a (expired)" pp_op (key, value)
             else
@@ -385,7 +402,7 @@ module Output(Op : S.PUBLISHER) = struct
 
   let register_actions ~schedule ~value ~config o =
     match o.op with
-    | `Finished _ | `Error _ | `Retry -> register_resolved ~schedule ~value ~config o
+    | `Finished _ | `Error _ | `Retry _ -> register_resolved ~schedule ~value ~config o
     | `Active _ ->
       cancel_expires o;
       o.ref_count <- o.ref_count + 1;
@@ -393,7 +410,7 @@ module Output(Op : S.PUBLISHER) = struct
           o.ref_count <- o.ref_count - 1;
           if o.ref_count = 0 && Op.auto_cancel then (
             match o.op with
-            | `Active op ->
+            | `Active (op, _) ->
               op.autocancelled <- true;
               Job.cancel op.job "Auto-cancelling job because it is no longer needed"
             | _ -> ()
@@ -404,7 +421,7 @@ module Output(Op : S.PUBLISHER) = struct
         method rebuild = None
       end
 
-  let set ?(schedule=Schedule.default) ctx key value =
+  let run ?(schedule=Schedule.default) ctx key value =
     Current_incr.of_cc begin
       Current_incr.read Current.Config.now @@ function
       | None -> Current_incr.write (Error (`Active `Ready), None)
@@ -427,9 +444,12 @@ module Output(Op : S.PUBLISHER) = struct
               o.ctx <- ctx;
               if changed then (
                 o.desired <- value;
-                match o.op with
-                | `Error _ -> o.op <- `Retry   (* Clear error when the desired value changes. *)
-                | `Active _ | `Finished _ | `Retry -> ()
+                (* Clear any error when the desired value changes: *)
+                match Op.latched, o.op with
+                | _, (`Active _ | `Finished _) -> ()
+                | true, `Retry _ -> ()
+                | true, `Error x -> o.op <- `Retry (Some (Error x));
+                | false, (`Error _ | `Retry _ )-> o.op <- `Retry None
               );
             );
             o
@@ -439,6 +459,14 @@ module Output(Op : S.PUBLISHER) = struct
             let o = get_output ~step_id ctx key value in
             outputs := Outputs.add key_digest o !outputs;
             Prometheus.Gauge.inc_one (Metrics.memory_cache_items Op.id);
+            (* If the saved state was an error, but the desired value has changed,
+               clear it. *)
+            begin match o.current, o.op with
+              | Some current, `Error x when current <> Value.digest value ->
+                let latched = if Op.latched then Some (Error x) else None in
+                o.op <- `Retry latched;
+              | _ -> ()
+            end;
             o
         in
         (* Ensure a build is in progress if we need one: *)
@@ -448,25 +476,30 @@ module Output(Op : S.PUBLISHER) = struct
         Prometheus.Counter.inc_one Metrics.evaluations_total;
         register_actions ~config ~schedule ~value o;
         (* Return the current state: *)
-        let v =
+        let v, update =
           match o.op with
-          | `Finished x -> Ok x
-          | `Error e -> (Error e :> Op.Outcome.t Current_term.Output.t)
-          | `Retry -> Error (`Active `Running)
-          | `Active op ->
+          | `Finished x -> Ok x, None
+          | `Error e -> (Error e :> Op.Outcome.t Current_term.Output.t), None
+          | `Retry None -> Error (`Active `Ready), None
+          | `Retry (Some latched) -> (latched :> Op.Outcome.t Current_term.Output.t), Some `Ready
+          | `Active (op, latched) ->
             let a =
               let started = Job.start_time op.job in
               if Lwt.state started = Lwt.Sleep then `Ready else `Running
             in
-            Error (`Active a)
+            match latched with
+            | None -> Error (`Active a), None
+            | Some latched -> (latched :> Op.Outcome.t Current_term.Output.t), Some a
         in
-        Current_incr.write (v, o.job_id)
+        let metadata = { Current.Metadata.job_id = o.job_id; update } in
+        Current_incr.write (v, Some metadata)
     end
 
-  let reset () =
+  let reset ~db =
     outputs := Outputs.empty;
     Prometheus.Gauge.set (Metrics.memory_cache_items Op.id) 0.0;
-    Db.drop_all Op.id
+    if db then
+      Db.drop_all Op.id
 end
 
 module Make(B : S.BUILDER) = struct
@@ -479,18 +512,33 @@ module Make(B : S.BUILDER) = struct
     module Value = Current.Unit
     module Outcome = B.Value
 
-    let publish op job key () =
+    let run op job key () =
       B.build op job key
 
     let pp f (key, ()) = B.pp f key
 
     let auto_cancel = B.auto_cancel
+
+    let latched = false
   end
 
-  include Output(Adaptor)
+  include Generic(Adaptor)
 
   let get ?schedule ctx key =
-    set ?schedule ctx key ()
+    run ?schedule ctx key ()
+end
+
+module Output(P : S.PUBLISHER) = struct
+  module Adaptor = struct
+    include P
+    let run = P.publish
+    let latched = false
+  end
+
+  include Generic(Adaptor)
+
+  let set ?schedule ctx key value =
+    run ?schedule ctx key value
 end
 
 module S = S
