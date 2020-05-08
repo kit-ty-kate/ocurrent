@@ -2,7 +2,7 @@
 
 type t = {
   repo : string;  (* Remote repository from which to pull. *)
-  gref : string;  (* Ref to pull, e.g. "master" or "pull/12/head". *)
+  gref : string;  (* Ref to pull, e.g. "master" or "pull/12/merge". *)
   hash : string;  (* Hash that [gref] is expected to have. *)
 } [@@deriving yojson]
 

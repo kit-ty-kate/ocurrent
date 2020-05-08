@@ -114,7 +114,7 @@ module Ref = struct
 
   let to_git = function
     | `Ref head -> head
-    | `PR id -> Fmt.strf "refs/pull/%d/head" id
+    | `PR id -> Fmt.strf "refs/pull/%d/merge" id
 end
 
 module Ref_map = Map.Make(Ref)

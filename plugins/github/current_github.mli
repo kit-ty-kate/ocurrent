@@ -78,7 +78,7 @@ module Api : sig
     val compare : t -> t -> int
 
     val to_git : t -> string
-    (** [to_git t] is the Git-format string of the ref, e.g."refs/pull/%d/head" *)
+    (** [to_git t] is the Git-format string of the ref, e.g."refs/pull/%d/merge" *)
   end
 
   module Ref_map : Map.S with type key = Ref.t
