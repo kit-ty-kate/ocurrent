@@ -9,7 +9,7 @@ end
 
 module Commit : sig
   type t
-  val id : t -> Current_git.Commit_id.t
+  val id : t -> (Current_git.Commit_id.t * string option)
   val repo_id : t -> Repo_id.t
   val owner_name : t -> string
   val hash : t -> string
@@ -20,10 +20,10 @@ module Commit : sig
 end
 
 module Ref : sig
-  type t = [ `Ref of string | `PR of int ]
+  type t = [ `Ref of string | `PR of int * string ]
   val compare : t -> t -> int
   val pp : t Fmt.t
-  val to_git : t -> string
+  val to_git : t -> (string * string option)
 end
 
 module Ref_map : Map.S with type key = Ref.t
@@ -33,7 +33,7 @@ val of_oauth : string -> t
 val exec_graphql : ?variables:(string * Yojson.Safe.t) list -> t -> string -> Yojson.Safe.t Lwt.t
 val head_commit : t -> Repo_id.t -> Commit.t Current.t
 val refs : t -> Repo_id.t -> Commit.t Ref_map.t Current.Primitive.t
-val head_of : t -> Repo_id.t -> [ `Ref of string | `PR of int ] -> Commit.t Current.t
+val head_of : t -> Repo_id.t -> Ref.t -> Commit.t Current.t
 val ci_refs : t -> Repo_id.t -> Commit.t list Current.t
 val cmdliner : t Cmdliner.Term.t
 

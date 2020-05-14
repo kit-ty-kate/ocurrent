@@ -45,7 +45,7 @@ let pipeline ~app () =
   repos |> Current.list_iter ~collapse_key:"repo" (module Github.Api.Repo) @@ fun repo ->
   Github.Api.Repo.ci_refs repo
   |> Current.list_iter (module Github.Api.Commit) @@ fun head ->
-  let src = Git.fetch (Current.map Github.Api.Commit.id head) in
+  let src = Git.fetch (Current.map fst (Current.map Github.Api.Commit.id head)) in
   Docker.build ~pool ~pull:false ~dockerfile (`Git src)
   |> Current.state
   |> Current.map github_status_of_state

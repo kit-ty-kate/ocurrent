@@ -33,7 +33,7 @@ let github_status_of_state = function
 
 let pipeline ~github ~repo () =
   let head = Github.Api.head_commit github repo in
-  let src = Git.fetch (Current.map Github.Api.Commit.id head) in
+  let src = Git.fetch (Current.map fst (Current.map Github.Api.Commit.id head)) in
   let dockerfile =
     let+ base = Docker.pull ~schedule:weekly "ocurrent/opam:alpine-3.10-ocaml-4.08" in
     `Contents (dockerfile ~base)

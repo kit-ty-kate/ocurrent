@@ -104,17 +104,17 @@ let no_token = {
 }
 
 module Ref = struct
-  type t = [ `Ref of string | `PR of int ] [@@deriving to_yojson]
+  type t = [ `Ref of string | `PR of int * string ] [@@deriving to_yojson]
 
   let compare = Stdlib.compare
 
   let pp f = function
     | `Ref r -> Fmt.string f r
-    | `PR pr -> Fmt.pf f "PR %d" pr
+    | `PR (pr, target) -> Fmt.pf f "PR %d (target commit: %s)" pr target
 
   let to_git = function
-    | `Ref head -> head
-    | `PR id -> Fmt.strf "refs/pull/%d/merge" id
+    | `Ref head -> (head, None)
+    | `PR (id, target_hash) -> (Fmt.strf "refs/pull/%d/merge" id, Some target_hash)
 end
 
 module Ref_map = Map.Make(Ref)
@@ -128,8 +128,8 @@ module Commit_id = struct
 
   let to_git { owner_name; id; hash } =
     let repo = Fmt.strf "https://github.com/%s.git" owner_name in
-    let gref = Ref.to_git id in
-    Current_git.Commit_id.v ~repo ~gref ~hash
+    let gref, target_hash = Ref.to_git id in
+    (Current_git.Commit_id.v ~repo ~gref ~hash, target_hash)
 
   let uri t =
     Uri.make ~scheme:"https" ~host:"github.com" ~path:(Printf.sprintf "/%s/commit/%s" t.owner_name t.hash) ()
@@ -348,6 +348,7 @@ let query_branches_and_open_prs = {|
           node {
             number
             headRefOid
+            baseRefOid
           }
         }
       }
@@ -366,8 +367,9 @@ let parse_pr ~owner_name json =
   let open Yojson.Safe.Util in
   let node = json / "node" in
   let hash = node / "headRefOid" |> to_string in
+  let target_hash = node / "baseRefOid" |> to_string in
   let pr = node / "number" |> to_int in
-  { Commit_id.owner_name; id = `PR pr; hash }
+  { Commit_id.owner_name; id = `PR (pr, target_hash); hash }
 
 let get_ci_refs t { Repo_id.owner; name } =
     let variables = [

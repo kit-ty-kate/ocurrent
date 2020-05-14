@@ -34,7 +34,7 @@ module Api : sig
   module Commit : sig
     type t
 
-    val id : t -> Current_git.Commit_id.t
+    val id : t -> (Current_git.Commit_id.t * string option)
     (** The commit ID, which can be used to fetch it. *)
 
     val set_status : t Current.t -> string -> Status.t Current.t -> unit Current.t
@@ -71,13 +71,13 @@ module Api : sig
   end
 
   module Ref : sig
-    type t = [ `Ref of string | `PR of int ]
+    type t = [ `Ref of string | `PR of int * string ]
 
     val pp : t Fmt.t
 
     val compare : t -> t -> int
 
-    val to_git : t -> string
+    val to_git : t -> (string * string option)
     (** [to_git t] is the Git-format string of the ref, e.g."refs/pull/%d/merge" *)
   end
 
@@ -92,7 +92,7 @@ module Api : sig
   val head_commit : t -> Repo_id.t -> Commit.t Current.t
   (** [head_commit t repo] evaluates to the commit at the head of the default branch in [repo]. *)
 
-  val head_of : t -> Repo_id.t -> [ `Ref of string | `PR of int ] -> Commit.t Current.t
+  val head_of : t -> Repo_id.t -> Ref.t -> Commit.t Current.t
   (** [head_of t repo id] evaluates to the commit at the head of [id] in [repo].
       e.g. [head_of t repo (`Ref "refs/heads/master")] *)
 
