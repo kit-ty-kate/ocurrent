@@ -46,3 +46,6 @@ let cp_r ~cancellable ~job ~src ~dst =
 
 let git_submodule_update ~cancellable ~job ~repo =
   git ~cancellable ~job ~cwd:repo ["submodule"; "update"; "--recursive"]
+
+let git_merge ~job ~repo hash =
+  git ~cancellable:false ~job ~cwd:repo ["merge"; "-q"; hash]

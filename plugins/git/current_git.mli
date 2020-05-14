@@ -3,7 +3,7 @@
 module Commit_id : sig
   include Set.OrderedType
 
-  val v : repo:string -> gref:string -> hash:string -> t
+  val v : ?target_hash:string -> repo:string -> gref:string -> hash:string -> t
   (** [v ~repo ~gref ~hash] identifies a commit that can be fetched from [repo]
       using [gref] as the reference name and has hash [hash]. *)
 
@@ -12,7 +12,7 @@ module Commit_id : sig
 
   val gref : t -> string
 
-  val hash : t -> string
+  val hash : t -> string * string option
   (* [hash t] is the Git commit hash. *)
 
   val equal : t -> t -> bool
@@ -28,7 +28,7 @@ module Commit : sig
   include Set.OrderedType
 
   val id : t -> Commit_id.t
-  val hash : t -> string
+  val hash : t -> (string * string option)
   val equal : t -> t -> bool
   val pp : t Fmt.t
 

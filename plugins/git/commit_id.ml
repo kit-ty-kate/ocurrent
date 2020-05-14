@@ -1,6 +1,7 @@
 [@@@ocaml.warning "-3"]
 
 type t = {
+  target_hash : string option;
   repo : string;  (* Remote repository from which to pull. *)
   gref : string;  (* Ref to pull, e.g. "master" or "pull/12/merge". *)
   hash : string;  (* Hash that [gref] is expected to have. *)
@@ -12,11 +13,12 @@ let ensure_no_spaces x =
   if String.contains x ' ' then
     Fmt.failwith "Spaces are not allowed here (in %S)" x
 
-let v ~repo ~gref ~hash =
+let v ?target_hash ~repo ~gref ~hash =
+  Option.iter ensure_no_spaces target_hash;
   ensure_no_spaces repo;
   ensure_no_spaces gref;
   ensure_no_spaces hash;
-  { repo; gref; hash }
+  { target_hash; repo; gref; hash }
 
 let pp f {repo; gref; hash} =
   Fmt.pf f "%s#%s (%s)" repo gref hash
@@ -35,7 +37,7 @@ let digest {repo; gref; hash} = Fmt.strf "%s %s %s" repo gref hash
 
 let repo t = t.repo
 let gref t = t.gref
-let hash t = t.hash
+let hash t = (t.hash, t.target_hash)
 
 (* git-clone doesn't like the "refs/heads" prefix. *)
 let strip_heads gref =

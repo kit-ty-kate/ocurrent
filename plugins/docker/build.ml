@@ -30,7 +30,7 @@ module Key = struct
 
   let source_to_json = function
     | `No_context -> `Null
-    | `Git commit -> `String (Current_git.Commit.hash commit)
+    | `Git commit -> `String (fst (Current_git.Commit.hash commit))
 
   let to_json { commit; dockerfile; docker_context; squash; build_args } =
     `Assoc [

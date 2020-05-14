@@ -129,7 +129,7 @@ module Commit_id = struct
   let to_git { owner_name; id; hash } =
     let repo = Fmt.strf "https://github.com/%s.git" owner_name in
     let gref, target_hash = Ref.to_git id in
-    (Current_git.Commit_id.v ~repo ~gref ~hash, target_hash)
+    Current_git.Commit_id.v ?target_hash ~repo ~gref ~hash
 
   let uri t =
     Uri.make ~scheme:"https" ~host:"github.com" ~path:(Printf.sprintf "/%s/commit/%s" t.owner_name t.hash) ()

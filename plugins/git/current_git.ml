@@ -70,20 +70,28 @@ let with_checkout ?(enable_submodules=true) ~job commit fn =
     short_hash Commit_id.pp_user_clone id;
   Current.Process.with_tmpdir ~prefix:"git-checkout" @@ fun tmpdir ->
   Cmd.cp_r ~cancellable:true ~job ~src:(Fpath.(repo / ".git")) ~dst:tmpdir >>!= fun () ->
-  Cmd.git_reset_hard ~job ~repo:tmpdir id.Commit_id.hash >>= function
-  | Ok () ->
-    (if enable_submodules then
-       Cmd.git_submodule_update ~cancellable:true ~job ~repo:tmpdir
-     else
-       Lwt.return (Ok ())
-    ) >>!= fun () ->
-    fn tmpdir
-  | Error e ->
+  let error e =
     Commit.check_cached ~cancellable:false ~job commit >>= function
     | Error not_cached ->
       Fetch_cache.invalidate id;
       Lwt.return (Error not_cached)
     | Ok () -> Lwt.return (Error e)
+  in
+  Cmd.git_reset_hard ~job ~repo:tmpdir (Option.get id.Commit_id.target_hash) >>= function
+  | Ok () ->
+      Cmd.git_merge ~job ~repo:tmpdir id.Commit_id.hash >>= begin function
+      | Ok () ->
+          (if enable_submodules then
+             Cmd.git_submodule_update ~cancellable:true ~job ~repo:tmpdir
+           else
+             Lwt.return (Ok ())
+          ) >>!= fun () ->
+          fn tmpdir
+      | Error e ->
+          error e
+      end
+  | Error e ->
+      error e
 
 module Local = struct
   module Ref_map = Map.Make(String)
@@ -109,7 +117,7 @@ module Local = struct
     match String.trim out with
     | "" -> Error (`Msg (Fmt.strf "Unknown ref %S" gref))
     | hash ->
-      let id = { Commit_id.repo = Fpath.to_string t.repo; gref; hash } in
+      let id = { Commit_id.repo = Fpath.to_string t.repo; gref; hash; target_hash = None } in
       Ok { Commit.repo = t.repo; id }
 
   let make_monitor t gref =
@@ -172,7 +180,7 @@ module Local = struct
     | Ok contents ->
       let open Astring in (* (from ocaml-git) *)
       match String.cuts ~sep:" " (String.trim contents) with
-      | [hash] -> Ok (`Commit {Commit_id.repo = Fpath.to_string repo; gref = "HEAD"; hash})
+      | [hash] -> Ok (`Commit {Commit_id.repo = Fpath.to_string repo; gref = "HEAD"; hash; target_hash = None})
       | [_;r]  -> Ok (`Ref r)
       | _      -> Error (`Msg (Fmt.strf "Can't parse HEAD %S" contents))
 
