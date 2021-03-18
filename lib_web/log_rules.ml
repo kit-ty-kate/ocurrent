@@ -42,19 +42,14 @@ let test_pattern pattern =
             Lwt.return_unit
           )
         end >|= fun () ->
-        begin match Current.Job.log_path job_id with
-          | Ok path ->
-            let log_data =
-              let ch = open_in_bin (Fpath.to_string path) in
-              Fun.protect
-                (fun () -> really_input_string ch (in_channel_length ch))
-                ~finally:(fun () -> close_in ch)
-            in
+        Current.Job.with_log_in job_id @@ begin function
+        | Ok ch ->
+            let log_data = really_input_string ch (in_channel_length ch) in
             Re.exec_opt re log_data |> Option.map (fun g ->
                 let text = Fmt.str "@[<v>%a@]" dump_groups (Re.Group.all g) in
                 job_id, text
               )
-          | Error _ -> None
+        | Error _ -> None
         end
       | row -> Fmt.failwith "Bad row from get_recent_jobs: %a" Current.Db.dump_row row
     )

@@ -239,8 +239,9 @@ module Job : sig
   val id : t -> job_id
   (** [id t] is the unique identifier for this job. *)
 
-  val log_path : job_id -> Fpath.t or_error
-  (** [log_path id] is the path of the log for job [id], if valid. *)
+  val with_log_in : job_id -> (in_channel or_error -> 'a) -> 'a
+  (** [with_log_in id f] opens the log for job [id] in read-only mode, if valid.
+      The channel will be closed after [f]. *)
 
   val pp_id : job_id Fmt.t
 

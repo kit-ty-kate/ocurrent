@@ -6,9 +6,7 @@ let sep = "@@LOG@@"
 
 let max_log_chunk_size = 102400L  (* 100K at a time *)
 
-let read ~start path =
-  let ch = open_in_bin (Fpath.to_string path) in
-  Fun.protect ~finally:(fun () -> close_in ch) @@ fun () ->
+let read ~start ch =
   let len = LargeFile.in_channel_length ch in
   let (+) = Int64.add in
   let (-) = Int64.sub in
@@ -18,7 +16,7 @@ let read ~start path =
   let len = min max_log_chunk_size (len - start) in
   really_input_string ch (Int64.to_int len), start + len
 
-let render ctx ~actions ~job_id ~log:path =
+let render ctx ~actions ~job_id ~log =
   let ansi = Current_ansi.create () in
   let action op = a_action (Fmt.str "/job/%s/%s" job_id op) in
   let csrf = Context.csrf ctx in
@@ -91,7 +89,7 @@ let render ctx ~actions ~job_id ~log:path =
           | `Pre -> i := `Log 0L; Lwt.return_some pre
           | `Log start ->
             let rec aux () =
-              begin match read ~start path with
+              begin match read ~start log with
                 | "", _ ->
                   begin match Current.Job.lookup_running job_id with
                     | None -> i := `Done; Lwt.return_some post
@@ -128,10 +126,10 @@ let job ~engine ~job_id = object
 
   method! private get ctx =
     let actions = lookup_actions ~engine job_id in
-    match Current.Job.log_path job_id with
+    Current.Job.with_log_in job_id @@ function
     | Error (`Msg msg) -> Context.respond_error ctx `Bad_request msg
-    | Ok path ->
-      let body = render ctx ~actions ~job_id ~log:path in
+    | Ok ch ->
+      let body = render ctx ~actions ~job_id ~log:ch in
       let headers =
         (* Otherwise, an nginx reverse proxy will wait for the whole log before sending anything. *)
         Cohttp.Header.init_with "X-Accel-Buffering" "no"

@@ -16,5 +16,6 @@
    prometheus
    re
    result
+   camllzma
    sqlite3)
  (preprocess (pps ppx_deriving.std)))

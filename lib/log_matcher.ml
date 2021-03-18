@@ -123,20 +123,15 @@ let analyse_string ?job log_text =
     job |> Option.iter (fun job -> Job.log job "%s" report);
     Some report
 
-let analyse_file ?job log_path =
-  let ch = open_in_bin (Fpath.to_string log_path) in
+let analyse_file ?job ch =
   (* re doesn't support streaming, so load the whole log at once. *)
-  let log_text =
-    Fun.protect
-      (fun () -> really_input_string ch (in_channel_length ch))
-      ~finally:(fun () -> close_in ch)
-  in
+  let log_text = really_input_string ch (in_channel_length ch) in
   analyse_string ?job log_text
 
 let analyse_job job =
-  match Job.log_path (Job.id job) with
+  Job.with_log_in (Job.id job) @@ function
   | Error `Msg e -> Fmt.failwith "Job log missing! %s" e
-  | Ok log_path -> analyse_file ~job log_path
+  | Ok ch -> analyse_file ~job ch
 
 let add_rule rule =
   ignore (Re.Pcre.re rule.pattern);  (* Check it compiles *)

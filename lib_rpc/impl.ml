@@ -2,9 +2,7 @@ open Lwt.Infix
 
 let max_log_chunk_size = 102400L  (* 100K at a time *)
 
-let read ~start path =
-  let ch = open_in_bin (Fpath.to_string path) in
-  Fun.protect ~finally:(fun () -> close_in ch) @@ fun () ->
+let read ~start ch =
   let len = LargeFile.in_channel_length ch in
   let (+) = Int64.add in
   let (-) = Int64.sub in
@@ -21,11 +19,11 @@ module Make (Current : S.CURRENT) = struct
     let job_cache = ref Current.Job.Map.empty
 
     let stream_log_data ~job_id ~start =
-      match Current.Job.log_path job_id with
+      Current.Job.with_log_in job_id @@ function
       | Error `Msg m -> Lwt_result.fail (`Capnp (`Exception (Capnp_rpc.Exception.v m)))
-      | Ok path ->
+      | Ok log ->
         let rec aux () =
-          match read ~start path with
+          match read ~start log with
           | ("", _) as x ->
             begin match Current.Job.lookup_running job_id with
               | None -> Lwt_result.return x
@@ -132,9 +130,9 @@ module Make (Current : S.CURRENT) = struct
         cap
 
     let local_opt engine job_id =
-      match Current.Job.log_path job_id with
+      match Current.Job.with_log_in job_id (function Ok _ -> Ok () | Error e -> Error e) with
       | Error _ as e -> e
-      | Ok _ -> Ok (local engine job_id)
+      | Ok () -> Ok (local engine job_id)
   end
 
   let job ~engine id = Job.local engine id

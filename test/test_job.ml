@@ -2,11 +2,8 @@ open Lwt.Infix
 
 module Job = Current.Job
 
-let read path =
-  let ch = open_in_bin (Fpath.to_string path) in
-  let data = really_input_string ch (in_channel_length ch) in
-  close_in ch;
-  data
+let read ch =
+  really_input_string ch (in_channel_length ch)
 
 let ( >>!= ) x f =
   x >>= function
@@ -24,9 +21,9 @@ let streams _switch () =
   Current.Process.exec ~cancellable:true ~job cmd >>!= fun () ->
   Current.Switch.turn_off switch >>= fun () ->
   assert (Lwt.state log_data != Lwt.Sleep);
-  let path = Job.log_path (Job.id job) |> Stdlib.Result.get_ok in
+  let content = Job.with_log_in (Job.id job) (fun x -> Stdlib.Result.get_ok x |> read) in
   Alcotest.(check string) "Combined results" "1970-01-01 00:00.00: Exec: \"sh\" \"-c\" \"echo out1; echo >&2 out2; echo out3\"\n\
-                                              out1\nout2\nout3\n" (read path);
+                                              out1\nout2\nout3\n" content;
   Lwt.return_unit
 
 let output _switch () =
@@ -38,9 +35,9 @@ let output _switch () =
   Current.Process.check_output ~cancellable:true ~job cmd >>!= fun out ->
   Current.Switch.turn_off switch >>= fun () ->
   Alcotest.(check string) "Output" "out1\nout3\n" out;
-  let path = Job.log_path (Job.id job) |> Stdlib.Result.get_ok in
+  let content = Job.with_log_in (Job.id job) (fun x -> Stdlib.Result.get_ok x |> read) in
   Alcotest.(check string) "Log" "1970-01-01 00:00.00: Exec: \"sh\" \"-c\" \"echo out1; echo >&2 out2; echo out3\"\n\
-                                 out2\n" (read path);
+                                 out2\n" content;
   Lwt.return_unit
 
 let cancel _switch () =
@@ -57,9 +54,9 @@ let cancel _switch () =
     | Error `Msg m when Astring.String.is_prefix ~affix:"Command \"sleep\" \"120\" failed with signal" m -> ()
     | Error `Msg m -> Alcotest.failf "Expected signal error, not %S" m
   end;
-  let path = Job.log_path (Job.id job) |> Stdlib.Result.get_ok in
+  let content = Job.with_log_in (Job.id job) (fun x -> Stdlib.Result.get_ok x |> read) in
   Alcotest.(check string) "Log" "1970-01-01 00:00.00: Exec: \"sleep\" \"120\"\n\
-                                 1970-01-01 00:00.00: Cancelling: Timeout\n" (read path);
+                                 1970-01-01 00:00.00: Cancelling: Timeout\n" content;
   Lwt.return_unit
 
 let pp_lwt_state f = function

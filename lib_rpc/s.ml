@@ -11,7 +11,7 @@ module type CURRENT = sig
   module Job : sig
     type t
     module Map : Map.S with type key = string
-    val log_path : string -> (Fpath.t, [`Msg of string]) result
+    val with_log_in : string -> ((in_channel, [`Msg of string]) result -> 'a) -> 'a
     val lookup_running : string -> t option
     val wait_for_log_data : t -> unit Lwt.t
     val approve_early_start : t -> unit

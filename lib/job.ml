@@ -11,6 +11,7 @@ module Metrics = struct
     Gauge.v ~help ~namespace ~subsystem "active_jobs"
 end
 
+module Lzma2 = Camllzma.Lzma2
 module Map = Map.Make(String)
 
 (* For unit-tests: *)
@@ -58,20 +59,29 @@ let id t = t.id
 
 let jobs_dir = lazy (Disk_store.state_dir "job")
 
-let log_path job_id =
+let with_log_in job_id f =
   let open Astring in
+  let with_in file =
+    match open_in_bin file with
+    | ch -> Ok (Fun.protect (fun () -> f (Ok ch)) ~finally:(fun () -> close_in ch))
+    | exception Sys_error _ -> Error ()
+  in
   let jobs_dir = Lazy.force jobs_dir in
   match String.cuts ~sep:"/" job_id with
   | [date; file] when
       not (String.is_prefix ~affix:"." date) &&
       not (String.is_prefix ~affix:"." file) ->
     let path = Fpath.(jobs_dir / date / (file ^ ".log")) in
-    begin match Bos.OS.File.exists path with
-      | Ok true -> Ok path
-      | Ok false -> Error (`Msg (Fmt.str "Job log %a does not exist" Fpath.pp path))
-      | Error _ as e -> e
+    begin match with_in (Fpath.to_string path) with
+    | Ok res -> res
+    | Error () ->
+        let path = Fpath.(+) path "xz" in
+        begin match with_in (Fpath.to_string path) with
+        | Ok res -> res
+        | Error () -> f (Error (`Msg (Fmt.str "Job log %a does not exist" Fpath.pp path)))
+        end
     end
-  | _ -> Error (`Msg (Fmt.str "Invalid job ID %S" job_id))
+  | _ -> f (Error (`Msg (Fmt.str "Invalid job ID %S" job_id)))
 
 let id_of_path path =
   match Fpath.split_base path with
@@ -99,6 +109,31 @@ let cancel t reason =
           (fun ex -> Fmt.failwith "Uncaught exception from cancel hook for %S: %a" (id t) Fmt.exn ex)
       )
 
+let compress_log file =
+  let compressed_file = Fpath.(+) file "xz" in
+  let strm = Lzma2.encoder ~bufsize:1024 Lzma2.PRESET_DEFAULT Lzma2.CHECK_CRC64 in
+  Lwt_io.with_file ~mode:Lwt_io.Input (Fpath.to_string file) begin fun ch_in ->
+    Lwt_io.with_file ~mode:Lwt_io.Output (Fpath.to_string compressed_file) begin fun ch_out ->
+      let rec aux action =
+        (if Lzma2.inbuf_is_empty strm then
+           Lwt_io.read ~count:1024 ch_in >|=
+           Lzma2.inbuf_set strm
+         else
+           Lwt.return_unit
+        ) >>= fun () ->
+        match Lzma2.next strm action with
+        | Ok Lzma2.OK ->
+            Lwt_io.write ch_out (Lzma2.outbuf strm) >>= fun () ->
+            Lzma2.outbuf_clear strm;
+            aux Lzma2.RUN
+        | Ok Lzma2.STREAM_END ->
+            Lwt_io.write ch_out (Lzma2.outbuf strm)
+        | Ok Lzma2.GET_CHECK | Error _ ->
+            Lwt.fail_with "liblzma failed"
+      in
+      aux Lzma2.RUN
+    end
+  end
 
 let create ?(priority=`Low) ~switch ~label ~config () =
   if not (Switch.is_on switch) then Fmt.failwith "Switch %a is not on! (%s)" Switch.pp switch label;
@@ -140,7 +175,7 @@ let create ?(priority=`Low) ~switch ~label ~config () =
         jobs := Map.remove id !jobs;
         Prometheus.Gauge.dec_one Metrics.active_jobs;
         Lwt_condition.broadcast t.log_cond ();
-        Lwt.return_unit
+        compress_log path
       );
     t
 

@@ -1,0 +1,3 @@
+[submodule "camllzma"]
+	path = camllzma
+	url = git://github.com/kit-ty-kate/camllzma.git
