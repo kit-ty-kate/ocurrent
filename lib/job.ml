@@ -111,29 +111,25 @@ let cancel t reason =
 
 let compress_log file =
   let compressed_file = Fpath.(+) file "xz" in
-  let strm = Lzma2.encoder ~bufsize:1024 Lzma2.PRESET_DEFAULT Lzma2.CHECK_CRC64 in
-  Lwt_io.with_file ~mode:Lwt_io.Input (Fpath.to_string file) begin fun ch_in ->
-    Lwt_io.with_file ~mode:Lwt_io.Output (Fpath.to_string compressed_file) begin fun ch_out ->
-      let rec aux action =
-        (if Lzma2.inbuf_is_empty strm then
-           Lwt_io.read ~count:1024 ch_in >|=
-           Lzma2.inbuf_set strm
-         else
-           Lwt.return_unit
-        ) >>= fun () ->
-        match Lzma2.next strm action with
-        | Ok Lzma2.OK ->
-            Lwt_io.write ch_out (Lzma2.outbuf strm) >>= fun () ->
-            Lzma2.outbuf_clear strm;
-            aux Lzma2.RUN
-        | Ok Lzma2.STREAM_END ->
-            Lwt_io.write ch_out (Lzma2.outbuf strm)
-        | Ok Lzma2.GET_CHECK | Error _ ->
-            Lwt.fail_with "liblzma failed"
-      in
-      aux Lzma2.RUN
-    end
-  end
+  let strm = Lzma2.new_encoder Lzma2.PRESET_DEFAULT Lzma2.CHECK_CRC64 in
+  Lwt_io.with_file ~mode:Lwt_io.input (Fpath.to_string file) @@ fun ch_in ->
+  Lwt_io.with_file ~mode:Lwt_io.output (Fpath.to_string compressed_file) @@ fun ch_out ->
+  (Lwt_io.read ch_in >|= Lzma2.push strm) >>= fun () ->
+  let rec aux action =
+    match Lzma2.compress strm action with
+    | `OK ->
+        Lwt_io.write ch_out (Lzma2.pop strm) >>= fun () ->
+        aux Lzma2.RUN
+    | `STREAM_END ->
+        Lwt_io.write ch_out (Lzma2.pop strm)
+    | `INPUT_NEEDED ->
+        aux Lzma2.FINISH
+    | `OUTPUT_BUFFER_TOO_SMALL ->
+        Lwt.fail_with "camllzma output buffer too small"
+    | `CORRUPT_DATA ->
+        Lwt.fail_with "compression failed"
+  in
+  aux Lzma2.RUN
 
 let create ?(priority=`Low) ~switch ~label ~config () =
   if not (Switch.is_on switch) then Fmt.failwith "Switch %a is not on! (%s)" Switch.pp switch label;
