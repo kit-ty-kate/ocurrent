@@ -5,7 +5,7 @@ val test :
   ?final_stats:Current_term.S.stats ->
   name:string ->
   (unit -> unit Current.t) ->
-  (int -> unit) ->
+  (int -> unit Lwt.t) ->
   unit Lwt.t
 (** [test ~name pipeline actions] runs [pipeline]. After each interation,
     it calls [actions i] where [i] is the number of the next step ([1] on the

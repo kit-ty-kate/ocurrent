@@ -25,7 +25,7 @@ val complete_pull : string -> Image.t Current.or_error -> unit
 val update_pull : string -> unit
 (** [update_pull tag] checks for updates to [tag] in the background. *)
 
-val reset : unit -> unit
+val reset : unit -> unit Lwt.t
 (** Reset state for tests. *)
 
 val assert_finished : unit -> unit

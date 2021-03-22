@@ -42,15 +42,15 @@ let v1 commit =
 
 let test_v1 _switch () =
   Driver.test ~name:"v1" (with_commit v1) @@ function
-  | 1 -> Git.complete_clone test_commit
-  | 2 -> Docker.complete "image-src-123" ~cmd:["make"; "test"] @@ Ok ()
-  | _ -> raise Exit
+  | 1 -> Git.complete_clone test_commit; Lwt.return_unit
+  | 2 -> Docker.complete "image-src-123" ~cmd:["make"; "test"] @@ Ok (); Lwt.return_unit
+  | _ -> Lwt.fail Exit
 
 let test_v1_cancel _switch () =
   Driver.test ~name:"v1c" (with_commit v1) @@ function
-  | 1 -> Git.complete_clone test_commit
-  | 2 -> Driver.cancel "docker run \"image-src-123\" \"make\" \"test\" (in-progress)"
-  | _ -> raise Exit
+  | 1 -> Git.complete_clone test_commit; Lwt.return_unit
+  | 2 -> Driver.cancel "docker run \"image-src-123\" \"make\" \"test\" (in-progress)"; Lwt.return_unit
+  | _ -> Lwt.fail Exit
 
 (* Similar, but here the test step requires both the binary and
    the source (perhaps for the test cases). If the tests pass then
@@ -63,10 +63,10 @@ let v2 commit =
 let test_v2 _switch () =
   let config = Current.Config.v ~confirm:Current.Level.Dangerous () in
   Driver.test ~config ~name:"v2" (with_commit v2) @@ function
-  | 1 -> Git.complete_clone test_commit
-  | 2 -> Docker.complete "image-src-123" ~cmd:["make"; "test"] @@ Ok ()
-  | 3 -> Current.Config.set_confirm config None
-  | _ -> raise Exit
+  | 1 -> Git.complete_clone test_commit; Lwt.return_unit
+  | 2 -> Docker.complete "image-src-123" ~cmd:["make"; "test"] @@ Ok (); Lwt.return_unit
+  | 3 -> Current.Config.set_confirm config None; Lwt.return_unit
+  | _ -> Lwt.fail Exit
 
 (* Build Linux, Mac and Windows binaries. If *all* tests pass (for
    all platforms) then deploy all binaries. *)
@@ -93,11 +93,12 @@ let test_v3 _switch () =
     }
   in
   Driver.test ~name:"v3" (with_commit v3) ~final_stats @@ function
-  | 1 -> Git.complete_clone test_commit
+  | 1 -> Git.complete_clone test_commit; Lwt.return_unit
   | 2 ->
     Docker.complete "lin-image-src-123" ~cmd:["make"; "test"] @@ Ok ();
     Docker.complete "win-image-src-123" ~cmd:["make"; "test"] @@ Error (`Msg "Missing DLL");
-  | _ -> raise Exit
+    Lwt.return_unit
+  | _ -> Lwt.fail Exit
 
 (* Monadic bind is also available if you need to take a decision based
    on the actual source code before deciding on the rest of the pipeline.
@@ -113,9 +114,9 @@ let v4 commit =
 
 let test_v4 _switch () =
   Driver.test ~name:"v4" (with_commit v4) @@ function
-  | 1 -> Git.complete_clone test_commit
-  | 2 -> Docker.complete "image-src-123" ~cmd:["make"; "test"] @@ Error (`Msg "Failed")
-  | _ -> raise Exit
+  | 1 -> Git.complete_clone test_commit; Lwt.return_unit
+  | 2 -> Docker.complete "image-src-123" ~cmd:["make"; "test"] @@ Error (`Msg "Failed"); Lwt.return_unit
+  | _ -> Lwt.fail Exit
 
 (* The opam-repo-ci pipeline. Build the package and test it.
    If the tests pass then query for the rev-deps and build and
@@ -141,9 +142,9 @@ let test_v5 _switch () =
     }
   in
   Driver.test ~name:"v5" ~final_stats (with_commit v5) @@ function
-  | 1 -> Git.complete_clone test_commit
-  | 2 -> Docker.complete "image-src-123" ~cmd:["make"; "test"] @@ Ok ()
-  | _ -> raise Exit
+  | 1 -> Git.complete_clone test_commit; Lwt.return_unit
+  | 2 -> Docker.complete "image-src-123" ~cmd:["make"; "test"] @@ Ok (); Lwt.return_unit
+  | _ -> Lwt.fail Exit
 
 let test_v5_nil _switch () =
   let final_stats =
@@ -157,9 +158,9 @@ let test_v5_nil _switch () =
   in
   let test_commit = Git.Commit.v ~repo:"my/project" ~hash:"456" in
   Driver.test ~name:"v5n" ~final_stats (with_commit v5) @@ function
-  | 1 -> Git.complete_clone test_commit
-  | 2 -> Docker.complete "image-src-456" ~cmd:["make"; "test"] @@ Ok ()
-  | _ -> raise Exit
+  | 1 -> Git.complete_clone test_commit; Lwt.return_unit
+  | 2 -> Docker.complete "image-src-456" ~cmd:["make"; "test"] @@ Ok (); Lwt.return_unit
+  | _ -> Lwt.fail Exit
 
 let test_option ~case commit =
   let src = fetch commit in
@@ -180,8 +181,8 @@ let test_option_some _switch () =
   test_option ~case:(Some "ocamlformat")
   |> with_commit
   |> (fun c -> Driver.test ~final_stats ~name:"option-some" c @@ function
-  | 1 -> Git.complete_clone test_commit
-  | _ -> raise Exit)
+  | 1 -> Git.complete_clone test_commit; Lwt.return_unit
+  | _ -> Lwt.fail Exit)
 
 let test_option_none _switch () =
   let final_stats =
@@ -196,8 +197,8 @@ let test_option_none _switch () =
   test_option ~case:None
   |> with_commit
   |> (fun c -> Driver.test ~final_stats ~name:"option-none" c @@ function
-    | 1 -> Git.complete_clone test_commit
-    | _ -> raise Exit)
+    | 1 -> Git.complete_clone test_commit; Lwt.return_unit
+    | _ -> Lwt.fail Exit)
 
 (* This is just to check the diagram when the state box is hidden. *)
 let test_state _switch () =
@@ -274,16 +275,19 @@ let test_latch _switch () =
     (* The "docker pull" box is orange as the image isn't available yet *)
     Git.complete_clone test_commit;
     Docker.complete_pull "alpine" @@ Ok "alpine:3.10";
+    Lwt.return_unit
   | 2 ->
     (* The "docker pull" box is green as the image has arrived *)
     Docker.update_pull "alpine";
+    Lwt.return_unit
   | 3 ->
     (* The "docker pull" box shows an orange-to-green gradient to indicate a
        background update, while "test" remains green (using the previous image). *)
     Docker.complete_pull "alpine" @@ Ok "alpine:3.11";
+    Lwt.return_unit
   | _ ->
     (* The "docker pull" box is green again *)
-    raise Exit
+    Lwt.fail Exit
 
 module Term = Current_term.Make(String)
 

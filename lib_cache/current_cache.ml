@@ -524,7 +524,18 @@ module Generic(Op : S.GENERIC) = struct
     end
 
   let reset ~db =
-    !instances |> Instances.iter (fun _ i -> i.Instance.ref_count <- -1);
+    Instances.fold (fun _ i prev ->
+      prev >>= fun () ->
+      begin match i.Instance.job_id with
+      | Some id ->
+          begin match Job.lookup_running id with
+          | Some job -> Job.wait_for_log_data job
+          | None -> Lwt.return_unit
+          end
+      | None -> Lwt.return_unit
+      end >|= fun () ->
+      i.Instance.ref_count <- -1
+    ) !instances Lwt.return_unit >|= fun () ->
     instances := Instances.empty;
     Prometheus.Gauge.set (Metrics.memory_cache_items Op.id) 0.0;
     if db then
