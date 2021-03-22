@@ -81,7 +81,7 @@ let basic _switch () =
     let+ x = get builds "a" in
     result := x
   in
-  BC.reset ~db:true >>= fun () ->
+  BC.reset ~db:true;
   let clock = Clock.create () in
   Alcotest.check database "Disk store initially empty" [] @@ disk_cache ();
   let builds = Build.create () in
@@ -90,21 +90,18 @@ let basic _switch () =
     let b = Builds.find "a" !builds in
     builds := Builds.remove "a" !builds;
     Clock.set clock 1.0;
-    Lwt.wakeup b @@ Ok "done";
-    Lwt.return_unit
+    Lwt.wakeup b @@ Ok "done"
   | 2 ->
     Alcotest.(check string) "Result correct" "done" !result;
     Alcotest.check database "Result stored" ["done 0/0/1 +0"] @@ disk_cache ();
     Driver.rebuild "a (completed)";
-    Lwt.return_unit
   | 3 ->
     let b = Builds.find "a" !builds in
     builds := Builds.remove "a" !builds;
-    Lwt.wakeup b @@ Ok "rebuild";
-    Lwt.return_unit
+    Lwt.wakeup b @@ Ok "rebuild"
   | 4 ->
     Alcotest.(check string) "Rebuild result" "rebuild" !result;
-    Lwt.fail Exit
+    raise Exit
   | _ ->
     assert false
 
@@ -126,7 +123,7 @@ let expires _switch () =
     )
     |> Current.map (fun x -> result := x)
   in
-  BC.reset ~db:true >>= fun () ->
+  BC.reset ~db:true;
   let clock = Clock.create () in
   Alcotest.check database "Disk store initially empty" [] @@ disk_cache ();
   let builds = Build.create () in
@@ -135,24 +132,21 @@ let expires _switch () =
     let b = Builds.find "a" !builds in
     builds := Builds.remove "a" !builds;
     Clock.set clock 1.0;
-    Lwt.wakeup b @@ Ok "done";
-    Lwt.return_unit
+    Lwt.wakeup b @@ Ok "done"
   | 2 ->
     Alcotest.check database "Result stored" ["done 0/0/1 +0"] @@ disk_cache ();
     Alcotest.(check result_t) "Result correct" (Ok "done,done") !result;
-    Clock.set clock 7.0;
-    Lwt.return_unit
+    Clock.set clock 7.0
   | 3 ->
     Alcotest.(check result_t) "Result latched" (Ok "done,done") !result;
     let b = Builds.find "a" !builds in
     Clock.set clock 8.0;
     Alcotest.check database "Disk store not invalidated" ["done 0/0/1 +0"] @@ disk_cache ();
-    Lwt.wakeup b @@ Ok "rebuild";
-    Lwt.return_unit
+    Lwt.wakeup b @@ Ok "rebuild"
   | _ ->
     Alcotest.check database "Result stored" ["done 0/0/1 +0"; "rebuild 7/7/8 +1"] @@ disk_cache ();
     Alcotest.(check result_t) "Result correct" (Ok "rebuild,rebuild") !result;
-    Lwt.fail Exit
+    raise Exit
 
 module Bool_var = Current.Var(struct type t = bool let pp = Fmt.bool let equal = (=) end)
 let wanted = Bool_var.create ~name:"wanted" (Ok true)
@@ -168,39 +162,35 @@ let autocancel _switch () =
     in
     result := r
   in
-  BC.reset ~db:true >>= fun () ->
+  BC.reset ~db:true;
   let clock = Clock.create () in
   Alcotest.check database "Disk store initially empty" [] @@ disk_cache ();
   Driver.test ~name:"cache" pipeline @@ function
   | 1 ->
     Alcotest.(check string) "Initially pending" "none" !result;
     (* This will turn off the switch. However, our test code ignores that. *)
-    Bool_var.set wanted @@ Ok false;
-    Lwt.return_unit
+    Bool_var.set wanted @@ Ok false
   | 2 ->
     Alcotest.(check string) "Not wanted" "unwanted" !result;
     (* Re-enable it before the old build has finished cancelling. *)
-    Bool_var.set wanted @@ Ok true;
-    Lwt.return_unit
+    Bool_var.set wanted @@ Ok true
   | 3 ->
     let b = Builds.find "a" !builds in
     builds := Builds.remove "a" !builds;
     Clock.set clock 1.0;
     (* The original build completes, but we ignore it as cancelled and start a replacement
        build. *)
-    Lwt.wakeup b @@ Ok "old-build";
-    Lwt.return_unit
+    Lwt.wakeup b @@ Ok "old-build"
   | 4 ->
     Alcotest.(check string) "No update yet" "unwanted" !result;
     let b = Builds.find "a" !builds in
     builds := Builds.remove "a" !builds;
     Clock.set clock 2.0;
     (* The replacement build completes. *)
-    Lwt.wakeup b @@ Ok "new-build";
-    Lwt.return_unit
+    Lwt.wakeup b @@ Ok "new-build"
   | 5 ->
     Alcotest.(check string) "Rebuild done" "new-build" !result;
-    Lwt.fail Exit
+    raise Exit
   | _ ->
     assert false
 
@@ -266,33 +256,28 @@ let set p k v =
 
 let output _switch () =
   V.set input @@ Ok "bar";
-  OC.reset ~db:true >>= fun () ->
+  OC.reset ~db:true;
   let p = Publish.create () in
   let pipeline () = V.get input |> set p "foo" in
   Driver.test ~name:"cache.output" pipeline @@ function
   | 1 ->
     Alcotest.(check string) "Publish has started" "init-changing" p.Publish.state;
     Publish.complete p @@ Ok ();
-    Lwt.return_unit
   | 2 ->
     Alcotest.(check string) "Publish has completed" "bar" p.Publish.state;
     V.set input @@ Ok "baz";
-    Lwt.return_unit
   | 3 ->
     Alcotest.(check string) "Changing to baz" "bar-changing" p.Publish.state;
     V.set input @@ Ok "new";
-    Lwt.return_unit
   | 4 ->
     Alcotest.(check string) "Changed during publish" "bar-changing" p.Publish.state;
     Publish.complete p @@ Error (`Msg "baz failed");
-    Lwt.return_unit
   | 5 ->
     Alcotest.(check string) "First change failed" "bar-changing-changing" p.Publish.state;
     Publish.complete p @@ Ok ();
-    Lwt.return_unit
   | 6 ->
     Alcotest.(check string) "Success" "new" p.Publish.state;
-    Lwt.fail Exit
+    raise Exit
   | _ ->
     assert false
 
@@ -311,68 +296,59 @@ let set2 p k v =
 
 let output_autocancel _switch () =
   V.set input @@ Ok "bar";
-  OC2.reset ~db:true >>= fun () ->
+  OC2.reset ~db:true;
   let p = Publish2.create () in
   let pipeline () = V.get input |> set2 p "foo" in
   Driver.test ~name:"cache.output_autocancel" pipeline @@ function
   | 1 ->
     Alcotest.(check string) "Publish has started" "init-changing" p.Publish.state;
     Publish.complete p @@ Ok ();
-    Lwt.return_unit
   | 2 ->
     Alcotest.(check string) "Publish has completed" "bar" p.Publish.state;
     V.set input @@ Ok "baz";
-    Lwt.return_unit
   | 3 ->
     Alcotest.(check string) "Changing to baz" "bar-changing" p.Publish.state;
     V.set input @@ Ok "new";
-    Lwt.return_unit
   | 4 ->
     (* At this point, we've noticed that the baz operation is no longer needed and sent a cancellation request.
        The job is over, but there's a pause because we re-evaluate. *)
-    Lwt.return_unit
+    ()
   | 5 ->
     Alcotest.(check string) "Changed during publish" "cancelled-changing" p.Publish.state;
     Publish.complete p @@ Ok ();
-    Lwt.return_unit
   | 6 ->
     Alcotest.(check string) "Success" "new" p.Publish.state;
     Driver.rebuild "Set foo to new (completed)";
-    Lwt.return_unit
   | 7 ->
     Alcotest.(check string) "Re-publish has started" "new-changing" p.Publish.state;
     Publish.complete p @@ Ok ();
-    Lwt.return_unit
   | 8 ->
     Alcotest.(check string) "Success" "new" p.Publish.state;
-    Lwt.fail Exit
+    raise Exit
   | _ ->
     assert false
 
 let output_retry _switch () =
-  OC2.reset ~db:true >>= fun () ->
+  OC2.reset ~db:true;
   let p = Publish2.create () in
   let pipeline () = set2 p "foo" (Current.return "value") in
   Driver.test ~name:"cache.output_retry" pipeline @@ function
   | 1 ->
     Alcotest.(check string) "Publish has started" "init-changing" p.Publish.state;
-    Publish.complete p @@ Error (`Msg "Failed");
-    Lwt.return_unit
+    Publish.complete p @@ Error (`Msg "Failed")
   | 2 ->
-    Driver.rebuild "Set foo to value: Failed";
-    Lwt.return_unit
+    Driver.rebuild "Set foo to value: Failed"
   | 3 ->
     Alcotest.(check string) "Publish has restarted" "init-changing-changing" p.Publish.state;
-    Publish.complete p @@ Ok ();
-    Lwt.return_unit
+    Publish.complete p @@ Ok ()
   | 4 ->
     Alcotest.(check string) "Publish has completed" "value" p.Publish.state;
-    Lwt.fail Exit
+    raise Exit
   | _ ->
     assert false
 
 let output_retry_new _switch () =
-  OC.reset ~db:true >>= fun () ->
+  OC.reset ~db:true;
   let p = Publish.create () in
   V.set input @@ Ok "1";
   let pipeline () = set p "foo" (V.get input) in
@@ -381,18 +357,15 @@ let output_retry_new _switch () =
     Alcotest.(check string) "Publish has started" "init-changing" p.Publish.state;
     (* We change our mind about the value while still setting the old one. *)
     V.set input @@ Ok "2";
-    Lwt.return_unit
   | 2 ->
     (* The original build fails. *)
-    Publish.complete p @@ Error (`Msg "Failed");
-    Lwt.return_unit
+    Publish.complete p @@ Error (`Msg "Failed")
   | 3 ->
     Alcotest.(check string) "Publish has restarted" "init-changing-changing" p.Publish.state;
-    Publish.complete p @@ Ok ();
-    Lwt.return_unit
+    Publish.complete p @@ Ok ()
   | 4 ->
     Alcotest.(check string) "Publish has completed" "2" p.Publish.state;
-    Lwt.fail Exit
+    raise Exit
   | _ ->
     assert false
 
@@ -436,7 +409,7 @@ let commit = V.create ~name:"commit" @@ Error (`Msg "(init)")
 let base = V.create ~name:"base" @@ Error (`Msg "(init)")
 
 let latched _switch () =
-  LC.reset ~db:true >>= fun () ->
+  LC.reset ~db:true;
   let p = Latched.create () in
   V.set base @@ Ok "alpine:3.10";
   V.set commit @@ Ok "r1";
@@ -449,36 +422,31 @@ let latched _switch () =
   | 1 ->
     Alcotest.(check result_t) "Op has started" (Error (`Active `Running)) !result;
     Lwt_condition.broadcast Latched.cond ();
-    Lwt.return_unit
   | 2 ->
     Alcotest.(check result_t) "3.10 ready" (Ok "alpine:3.10-outcome") !result;
     Alcotest.(check (option string)) "3.10 result" (Some "alpine:3.10-done") (Hashtbl.find_opt p "r1");
     V.set base @@ Ok "alpine:3.11";
-    Lwt.return_unit
     (* Changing the base latches the result *)
   | 3 ->
     Alcotest.(check result_t) "3.10 latched" (Ok "alpine:3.10-outcome") !result;
     Lwt_condition.broadcast Latched.cond ();
-    Lwt.return_unit
   | 4 ->
     Alcotest.(check result_t) "3.11 ready" (Ok "alpine:3.11-outcome") !result;
     Alcotest.(check (option string)) "3.11 result" (Some "alpine:3.11-done") (Hashtbl.find_opt p "r1");
     (* Changing the commit does not latch *)
     V.set commit @@ Ok "r2";
-    Lwt.return_unit
   | 5 ->
     Alcotest.(check result_t) "Not latched" (Error (`Active `Running)) !result;
     Alcotest.(check (option string)) "No r2 result yet" None (Hashtbl.find_opt p "r2");
     Lwt_condition.broadcast Latched.cond ();
-    Lwt.return_unit
   | 6 ->
     Alcotest.(check (option string)) "3.11 result" (Some "alpine:3.11-done") (Hashtbl.find_opt p "r2");
-    Lwt.fail Exit
+    raise Exit
   | _ ->
     assert false
 
 let latched_autocancel _switch () =
-  LC.reset ~db:true >>= fun () ->
+  LC.reset ~db:true;
   let p = Latched.create () in
   V.set base @@ Ok "alpine:3.10";
   V.set commit @@ Ok "r1";
@@ -491,35 +459,30 @@ let latched_autocancel _switch () =
   | 1 ->
     Alcotest.(check result_t) "Op has started" (Error (`Active `Running)) !result;
     Lwt_condition.broadcast Latched.cond ();
-    Lwt.return_unit
   | 2 ->
     Alcotest.(check result_t) "3.10 ready" (Ok "alpine:3.10-outcome") !result;
     Alcotest.(check (option string)) "3.10 result" (Some "alpine:3.10-done") (Hashtbl.find_opt p "r1");
     V.set base @@ Ok "alpine:3.11";
-    Lwt.return_unit
     (* Changing the base latches the result *)
   | 3 ->
     Alcotest.(check result_t) "3.10 latched" (Ok "alpine:3.10-outcome") !result;
     V.set base @@ Ok "alpine:3.12";
-    Lwt.return_unit
     (* Changing the base again auto-cancels, still latching the result *)
   | 4 ->
     Alcotest.(check result_t) "3.10 latched" (Ok "alpine:3.10-outcome") !result;
     Lwt_condition.broadcast Latched.cond ();    (* Cancel takes effect *)
-    Lwt.return_unit
   | 5 ->
     Alcotest.(check result_t) "3.10 latched" (Ok "alpine:3.10-outcome") !result;
     Lwt_condition.broadcast Latched.cond ();    (* Second update completes *)
-    Lwt.return_unit
   | 6 ->
     Alcotest.(check result_t) "3.12 ready" (Ok "alpine:3.12-outcome") !result;
     Alcotest.(check (option string)) "3.12 result" (Some "alpine:3.12-done") (Hashtbl.find_opt p "r1");
-    Lwt.fail Exit
+    raise Exit
   | _ ->
     assert false
 
 let clear_error _switch () =
-  LC.reset ~db:true >>= fun () ->
+  LC.reset ~db:true;
   let p = Latched.create () in
   V.set base @@ Ok "";
   V.set commit @@ Ok "r1";
@@ -532,38 +495,32 @@ let clear_error _switch () =
   | 1 ->
     Alcotest.(check result_t) "Op has started" (Error (`Active `Running)) !result;
     Lwt_condition.broadcast Latched.cond ();
-    Lwt.return_unit
   | 2 ->
     Alcotest.(check result_t) "Bad base failed" (Error (`Msg "bad-base")) !result;
     V.set base @@ Ok "alpine:3.11";
-    Lwt.return_unit
     (* Changing the base latches the result *)
   | 3 ->
     Alcotest.(check result_t) "Failure latched" (Error (`Msg "bad-base")) !result;
     Lwt_condition.broadcast Latched.cond ();
-    Lwt.return_unit
   | 4 ->
     Alcotest.(check result_t) "3.11 ready" (Ok "alpine:3.11-outcome") !result;
     V.set base @@ Ok "";
-    Lwt.return_unit
     (* Generate the error state again *)
   | 5 ->
     Alcotest.(check result_t) "3.11 still ready" (Ok "alpine:3.11-outcome") !result;
     Lwt_condition.broadcast Latched.cond ();
-    Lwt.return_unit
   | 6 ->
     Alcotest.(check result_t) "Bad base failed" (Error (`Msg "bad-base")) !result;
     (* This time, reset the cache (simulating a restart of the service). *)
-    LC.reset ~db:false >|= fun () ->
+    LC.reset ~db:false;
     V.set base @@ Ok "alpine:3.11";
   | 7 ->
     (* Failure is latched, but a rebuild is in progress: *)
     Alcotest.(check result_t) "Bad base failed" (Error (`Msg "bad-base")) !result;
     Lwt_condition.broadcast Latched.cond ();
-    Lwt.return_unit
   | 8 ->
     Alcotest.(check result_t) "3.11 ready" (Ok "alpine:3.11-outcome") !result;
-    Lwt.fail Exit
+    raise Exit
   | _ ->
     assert false
 

@@ -12,7 +12,7 @@ end
 val complete_clone : Commit.t -> unit
 (** Test function that records a clone as completed. *)
 
-val reset : unit -> unit Lwt.t
+val reset : unit -> unit
 (** Reset all repositories to uncloned. *)
 
 val fetch : Commit.t Current.t -> Fpath.t Current.t

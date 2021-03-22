@@ -22,7 +22,7 @@ module Make (B : S.BUILDER) : sig
   val invalidate : B.Key.t -> unit
   (** [invalidate key] removes key from the cache. *)
 
-  val reset : db:bool -> unit Lwt.t
+  val reset : db:bool -> unit
   (** [reset ~db] clears the cache. Useful for unit-tests.
       @param db Also clear from the on-disk database table. *)
 end
@@ -32,7 +32,7 @@ module Output (P : S.PUBLISHER) : sig
   val set : ?schedule:Schedule.t -> P.t -> P.Key.t -> P.Value.t -> P.Outcome.t Current.Primitive.t
   (** [set p k v] is a term for the result of setting [k] to [v]. *)
 
-  val reset : db:bool -> unit Lwt.t
+  val reset : db:bool -> unit
   (** [reset ~db] clears the cache. Useful for unit-tests.
       @param db Also clear from the on-disk database table. *)
 end
@@ -42,7 +42,7 @@ module Generic (Op : S.GENERIC) : sig
   val run : ?schedule:Schedule.t -> Op.t -> Op.Key.t -> Op.Value.t -> Op.Outcome.t Current.Primitive.t
   (** [run t k v] is a term for the result of processing [(k, v)]. *)
 
-  val reset : db:bool -> unit Lwt.t
+  val reset : db:bool -> unit
   (** [reset ~db] clears the cache. Useful for unit-tests.
       @param db Also clear from the on-disk database table. *)
 end
