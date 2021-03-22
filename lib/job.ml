@@ -165,7 +165,7 @@ let create ?(priority=`Low) ~switch ~label ~config () =
             t.cancel_hooks <- `Cancelled reason;
             run_cancel_hooks ~reason hooks
           | `Cancelled _ -> Lwt.return_unit
-        end >|= fun () ->
+        end >>= fun () ->
         close_out ch;
         t.ch <- None;
         jobs := Map.remove id !jobs;

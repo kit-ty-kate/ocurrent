@@ -529,7 +529,7 @@ module Generic(Op : S.GENERIC) = struct
       begin match i.Instance.job_id with
       | Some id ->
           begin match Job.lookup_running id with
-          | Some job -> Job.cancel job "test"; Job.wait_for_log_data job
+          | Some job -> Job.wait_for_log_data job
           | None -> Lwt.return_unit
           end
       | None -> Lwt.return_unit
