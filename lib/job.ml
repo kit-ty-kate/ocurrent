@@ -159,7 +159,6 @@ let create ?(priority=`Low) ~switch ~label ~config () =
     jobs := Map.add id t !jobs;
     Prometheus.Gauge.inc_one Metrics.active_jobs;
     Switch.add_hook_or_fail switch (fun () ->
-        compress_log path >>= fun () ->
         begin match t.cancel_hooks with
           | `Hooks hooks ->
             let reason = "Job complete" in
@@ -172,6 +171,7 @@ let create ?(priority=`Low) ~switch ~label ~config () =
         jobs := Map.remove id !jobs;
         Prometheus.Gauge.dec_one Metrics.active_jobs;
         Lwt_condition.broadcast t.log_cond ();
+        Lwt.async (fun () -> compress_log path)
       );
     t
 
