@@ -25,9 +25,15 @@ let job_id_of_key = Hashtbl.create 10
 module Schedule = struct
   type t = {
     valid_for : Duration.t option;
+    mutable sleep_threads : unit Lwt.t list ref; (* synchronises different users of Schedule.t
+                                                    so that e.g. several git clone would not start
+                                                    one after the other instead of e.g. weekly *)
   }
 
-  let v ?valid_for () = { valid_for }
+  let v ?valid_for () = {
+    valid_for;
+    sleep_threads = ref [];
+  }
 
   let default = v ()
 end
@@ -289,10 +295,27 @@ module Generic(Op : S.GENERIC) = struct
              )
         )
 
-    let limit_expires t time =
+    let limit_expires t ~schedule time =
       let set () =
         let remaining_time = time -. !Job.timestamp () in
-        let sleep_thread = if remaining_time > 0.0 then !Job.sleep remaining_time else Lwt.return_unit in
+        let sleep_thread =
+          let sleep_thread = if remaining_time > 0.0 then !Job.sleep remaining_time else Lwt.return_unit in
+          let sleep_threads = schedule.Schedule.sleep_threads in
+          sleep_threads := sleep_thread :: !sleep_threads;
+          let rec sync prev =
+            Lwt.join prev >>= fun () ->
+            let next = !sleep_threads in
+            if prev == next then begin
+              if sleep_threads == schedule.Schedule.sleep_threads then begin
+                schedule.Schedule.sleep_threads <- ref [];
+              end;
+              Lwt.return_unit
+            end else begin
+              sync next
+            end
+          in
+          sync !sleep_threads
+        in
         let cancelled = ref false in
         Lwt.async
           (fun () ->
@@ -392,7 +415,7 @@ module Generic(Op : S.GENERIC) = struct
           end
         | Some duration ->
           let expires = Duration.to_f duration +. t.mtime in
-          limit_expires t expires;
+          limit_expires t ~schedule expires;
           Current.Job.register_actions job_id @@
           object
             method pp f =
