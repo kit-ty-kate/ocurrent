@@ -10,7 +10,7 @@ let program_name = "docker_custom"
 
 open Current.Syntax
 
-let weekly = Current_cache.Schedule.v ~valid_for:(Duration.of_min 5) ()
+let weekly = Current_cache.Schedule.v ~valid_for:(Duration.of_day 7) ()
 
 let () = Prometheus_unix.Logging.init ()
 
@@ -77,14 +77,9 @@ let test image =
 (* Build a docker image with nginx and curl and then test it. *)
 let pipeline () =
   let dockerfile =
-    let+ base = Docker.pull ~schedule:weekly "nginx"
-    and+ a = Current_git.clone ~schedule:weekly ~gref:"main" "/tmp/a"
-    and+ b = Current_git.clone ~schedule:weekly ~gref:"main" "/tmp/b"
-    in
-    let a = Current_git.Commit.hash a and b = Current_git.Commit.hash b in
+    let+ base = Docker.pull ~schedule:weekly "nginx" in
     `Contents Dockerfile.(
         from (Docker.Image.hash base) @@
-        comment "a = %s, b = %s" a b @@
         run "apt-get update && apt-get install -y curl --no-install-recommends"
       )
   in
