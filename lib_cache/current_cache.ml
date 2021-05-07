@@ -28,11 +28,13 @@ module Schedule = struct
     mutable sleep_threads : unit Lwt.t list ref; (* synchronises different users of Schedule.t
                                                     so that e.g. several git clone would not start
                                                     one after the other instead of e.g. weekly *)
+    mutable cond : unit Lwt_condition.t; (* Just a lock to notify the change of values only once *)
   }
 
   let v ?valid_for () = {
     valid_for;
     sleep_threads = ref [];
+    cond = Lwt_condition.create ();
   }
 
   let default = v ()
@@ -167,14 +169,16 @@ module Generic(Op : S.GENERIC) = struct
         Db.invalidate ~op:Op.id (Op.Key.digest t.key)
       | _ -> assert false
 
-    let notify t =
+    let notify ~do_update t =
       Current_incr.change t.notify () ~eq:(fun _ _ -> false);
-      Current.Engine.update ()
+      if do_update then begin
+        Current.Engine.update ();
+      end
 
     (* If [t] isn't in (or moving to) the desired state, start a thread to do that,
        unless we already tried that and failed. Only call this if the instance is currently
        wanted. If called from an async thread, you must call [notify] afterwards too. *)
-    let rec maybe_start ~config t =
+    let rec maybe_start ~do_update ~config t =
       assert (t.ref_count > 0);
       match t.op with
       | `Finished (Error _) -> () (* Wait for error to be cleared. *)
@@ -192,7 +196,7 @@ module Generic(Op : S.GENERIC) = struct
         (* Cancel existing job. When that finishes, we'll get called again. *)
         Job.cancel op.job "Auto-cancelling job because it is no longer needed"
       | `Retry latched ->
-        publish ~latched ~config t
+        publish ~do_update ~latched ~config t
       | `Finished outcome ->
         match t.current with
         | Some current when current = Value.digest t.desired -> () (* Already the desired value. *)
@@ -200,11 +204,11 @@ module Generic(Op : S.GENERIC) = struct
           (* Either we don't know the current state, or we know we want something different.
              We're not already running, and we haven't already failed. Time to publish! *)
           let latched = if Op.latched then Some outcome else None in
-          publish ~latched ~config t
-    and maybe_restart ~config t =
-      maybe_start ~config t;
-      notify t
-    and publish ~latched ~config t =
+          publish ~do_update ~latched ~config t
+    and maybe_restart ~do_update ~config t =
+      maybe_start ~do_update ~config t;
+      notify ~do_update t
+    and publish ~do_update ~latched ~config t =
       (* Once we start publishing, we don't know the state (it might be better to
          wait until the job starts before doing this): *)
       t.current <- None;
@@ -223,7 +227,7 @@ module Generic(Op : S.GENERIC) = struct
         (fun () ->
            Job.start_time job >>= fun _ ->
            Lwt.pause () >|= fun () ->        (* Ensure we're outside any propagate *)
-           notify t
+           notify ~do_update t
         );
       let key_digest = Op.Key.digest t.key in
       Hashtbl.add key_of_job_id job_id (Op.id, key_digest);
@@ -290,12 +294,13 @@ module Generic(Op : S.GENERIC) = struct
                 Current.Switch.turn_off switch >|= fun () ->
                 (* While we were working, we might have decided we wanted something else.
                    If so, start that now. *)
-                if t.ref_count > 0 then maybe_restart ~config t
+                if t.ref_count > 0 then maybe_restart ~do_update ~config t
                 else t.release ()
              )
         )
 
     let limit_expires t ~schedule time =
+      let cond = schedule.Schedule.cond in
       let set () =
         let remaining_time = time -. !Job.timestamp () in
         let sleep_thread =
@@ -308,8 +313,20 @@ module Generic(Op : S.GENERIC) = struct
             if prev == next then begin
               if sleep_threads == schedule.Schedule.sleep_threads then begin
                 schedule.Schedule.sleep_threads <- ref [];
-              end;
-              Lwt.return_unit
+                schedule.Schedule.cond <- Lwt_condition.create ();
+                let wait_len = List.length next in
+                let rec wait i =
+                  if i < wait_len then
+                    Lwt_condition.wait cond >>= fun () ->
+                    wait (succ i)
+                  else
+                    Lwt.return_unit
+                in
+                wait 1 >>= fun () ->
+                Lwt.return true
+              end else begin
+                Lwt.return false
+              end
             end else begin
               sync next
             end
@@ -321,7 +338,7 @@ module Generic(Op : S.GENERIC) = struct
           (fun () ->
              Lwt.try_bind
                (fun () -> sleep_thread)
-               (fun () ->
+               (fun do_update ->
                   Lwt.pause () >|= fun () ->        (* Ensure we're outside any propagate *)
                   if not !cancelled then (
                     t.expires <- None;
@@ -334,9 +351,13 @@ module Generic(Op : S.GENERIC) = struct
                     in
                     t.op <- `Retry latched;
                     t.current <- None;
-                    match Current_incr.observe Current.Config.now with
-                    | Some config -> maybe_restart ~config t
+                    begin match Current_incr.observe Current.Config.now with
+                    | Some config -> maybe_restart ~do_update ~config t
                     | None -> Log.warn (fun f -> f "Can't trigger restart as config is now None (shutting down?)")
+                    end;
+                    if not do_update then begin
+                      Lwt_condition.signal cond ();
+                    end
                   )
                )
                (function
@@ -401,7 +422,7 @@ module Generic(Op : S.GENERIC) = struct
           | `Finished _ | `Retry _ ->
             t.op <- `Retry None;
             invalidate t;
-            maybe_restart ~config t;
+            maybe_restart ~do_update:true ~config t;
             Option.get t.job_id
           | `Active _ ->
             Log.info (fun f -> f "Rebuild(%a): already rebuilding" pp_op (key, t.desired));
@@ -478,7 +499,7 @@ module Generic(Op : S.GENERIC) = struct
           )
         );
       (* Ensure a build is in progress if we need one: *)
-      maybe_start ~config t;
+      maybe_start ~do_update:true ~config t;
       (* Read from [t.notify] so that we re-evaluate the following when something changes. *)
       Current_incr.read (Current_incr.of_var t.notify) @@ fun () ->
       Prometheus.Counter.inc_one Metrics.evaluations_total;
