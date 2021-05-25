@@ -16,7 +16,7 @@ let catch = function
 
 let msg_of_exn = function
   | Failure m -> m
-  | ex -> Printexc.to_string ex
+  | ex -> Printexc.to_string ex ^ " -- " ^ Printexc.get_backtrace ()
 
 let bind x f =
   match x with
